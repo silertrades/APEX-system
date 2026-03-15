@@ -17,7 +17,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 # -----------------------------------------------------------------------------
 # SYMBOLS TO MONITOR
 # -----------------------------------------------------------------------------
-FUTURES_SYMBOLS = ["ES", "NQ", "CL"]
+FUTURES_SYMBOLS = []
 CRYPTO_SYMBOLS  = ["BTCUSDT", "ETHUSDT"]
 
 # -----------------------------------------------------------------------------
@@ -29,6 +29,9 @@ TIMEFRAMES = {
     "ITF": "1H",
     "LTF": "15m",
 }
+
+# Data source mode — "binance" or "yfinance"
+DATA_SOURCE = "binance"
 
 # -----------------------------------------------------------------------------
 # SCORING THRESHOLDS
