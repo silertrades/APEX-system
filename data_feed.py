@@ -1,5 +1,5 @@
 # =============================================================================
-# APEX SYSTEM — data_feed.py
+# APEX SYSTEM — data_feed.py (Binance real-time version)
 # =============================================================================
 
 import time
@@ -9,13 +9,6 @@ import threading
 import requests
 import numpy as np
 import pandas as pd
-import yfinance as yf
-
-try:
-    from tvdatafeed import TvDatafeed, Interval
-    TV_AVAILABLE = True
-except ImportError:
-    TV_AVAILABLE = False
 
 try:
     import websocket
@@ -24,7 +17,7 @@ except ImportError:
     WS_AVAILABLE = False
 
 from config import (
-    FUTURES_SYMBOLS, CRYPTO_SYMBOLS, TIMEFRAMES,
+    CRYPTO_SYMBOLS, TIMEFRAMES,
     CVD_LOOKBACK, WS_RECONNECT_SECONDS, DEBUG_MODE
 )
 
@@ -34,9 +27,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("data_feed")
 
-CANDLE_COUNT = 500
+BINANCE_REST = "https://api.binance.com"
 
-YF_INTERVAL_MAP = {
+# Binance interval map
+BINANCE_INTERVAL_MAP = {
     "1D":  "1d",
     "4H":  "4h",
     "1H":  "1h",
@@ -45,78 +39,56 @@ YF_INTERVAL_MAP = {
     "1m":  "1m",
 }
 
+CANDLE_COUNT = 500
+
 
 # =============================================================================
-# OHLCV FEED
+# OHLCV FEED — Binance REST API (real-time, no delay)
 # =============================================================================
 
 class OHLCVFeed:
 
-    def __init__(self):
-        if TV_AVAILABLE:
-            try:
-                self.tv = TvDatafeed()
-                self.use_tv = True
-                log.info("TvDatafeed connected.")
-            except Exception as e:
-                log.warning(f"TvDatafeed failed ({e}). Using yfinance.")
-                self.use_tv = False
-        else:
-            self.use_tv = False
-
     def get_candles(self, symbol: str, timeframe: str, n_bars: int = CANDLE_COUNT) -> pd.DataFrame:
-        return self._fetch_yf(symbol, timeframe, n_bars)
+        """Fetch OHLCV candles from Binance REST API."""
+        interval = BINANCE_INTERVAL_MAP.get(timeframe, "1h")
+        try:
+            url    = f"{BINANCE_REST}/api/v3/klines"
+            params = {"symbol": symbol, "interval": interval, "limit": n_bars}
+            resp   = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            raw = resp.json()
+
+            df = pd.DataFrame(raw, columns=[
+                "timestamp", "open", "high", "low", "close", "volume",
+                "close_time", "quote_volume", "trades",
+                "taker_buy_base", "taker_buy_quote", "ignore"
+            ])
+
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df.set_index("timestamp", inplace=True)
+            df = df[["open", "high", "low", "close", "volume"]].astype(float)
+            df.dropna(inplace=True)
+            log.debug(f"{symbol} {timeframe}: {len(df)} candles from Binance.")
+            return df
+
+        except Exception as e:
+            log.error(f"Binance OHLCV failed for {symbol} {timeframe}: {e}")
+            return pd.DataFrame()
 
     def get_all_timeframes(self, symbol: str) -> dict:
+        """Fetch all configured timeframes for a symbol."""
         result = {}
         for tf_name, tf_str in TIMEFRAMES.items():
-            try:
-                df = self.get_candles(symbol, tf_str)
-                if df is not None and len(df) > 50:
-                    result[tf_name] = df
-                    log.debug(f"{symbol} {tf_name}: {len(df)} candles loaded.")
-                else:
-                    log.warning(f"{symbol} {tf_name}: insufficient data.")
-            except Exception as e:
-                log.error(f"Failed to fetch {symbol} {tf_name}: {e}")
+            df = self.get_candles(symbol, tf_str)
+            if not df.empty and len(df) > 50:
+                result[tf_name] = df
+            else:
+                log.warning(f"{symbol} {tf_name}: insufficient data.")
         return result
-
-    def _fetch_yf(self, symbol: str, timeframe: str, n_bars: int) -> pd.DataFrame:
-        yf_interval = YF_INTERVAL_MAP.get(timeframe, "1h")
-
-        if symbol == "ES":
-            yf_symbol = "ES=F"
-        elif symbol == "NQ":
-            yf_symbol = "NQ=F"
-        elif symbol == "CL":
-            yf_symbol = "CL=F"
-        elif symbol.endswith("USDT"):
-            yf_symbol = symbol.replace("USDT", "-USD")
-        else:
-            yf_symbol = symbol
-
-        period_map = {
-            "1D": "2y", "4H": "60d", "1H": "30d",
-            "15m": "8d", "5m": "5d", "1m": "1d"
-        }
-        period = period_map.get(timeframe, "30d")
-
-        try:
-            ticker = yf.Ticker(yf_symbol)
-            df = ticker.history(period=period, interval=yf_interval)
-            if df.empty:
-                return pd.DataFrame()
-            df.columns = [c.lower() for c in df.columns]
-            df = df[["open", "high", "low", "close", "volume"]].copy()
-            df.dropna(inplace=True)
-            return df.tail(n_bars)
-        except Exception as e:
-            log.error(f"yfinance fetch failed for {symbol} {timeframe}: {e}")
-            return pd.DataFrame()
 
 
 # =============================================================================
-# ORDER FLOW FEED
+# ORDER FLOW FEED — Binance WebSocket (live CVD)
 # =============================================================================
 
 class OrderFlowFeed:
@@ -196,8 +168,8 @@ class OrderFlowFeed:
 
         price_moved_dn = prices[mid:].mean() < prices[:mid].mean()
         price_moved_up = prices[mid:].mean() > prices[:mid].mean()
-        cvd_moved_up   = cvd[mid:].mean()   > cvd[:mid].mean()
-        cvd_moved_dn   = cvd[mid:].mean()   < cvd[:mid].mean()
+        cvd_moved_up   = cvd[mid:].mean()    > cvd[:mid].mean()
+        cvd_moved_dn   = cvd[mid:].mean()    < cvd[:mid].mean()
 
         if price_moved_dn and cvd_moved_up:
             strength = min(1.0, abs(prices[-1] - prices[0]) / (prices[0] + 1e-9) * 10)
@@ -213,59 +185,73 @@ class OrderFlowFeed:
 
 
 # =============================================================================
-# MACRO FEED
+# MACRO FEED — Binance-based proxies (no yfinance delay)
 # =============================================================================
 
 class MacroFeed:
+    """
+    For crypto-only mode we use Binance-available macro proxies:
+    - VIX proxy: BTCUSDT 1D volatility (realized vol as fear gauge)
+    - DXY proxy: BTCUSDT/ETHUSDT correlation divergence
+    - Yield curve: fixed neutral value until futures data added
+    """
 
     CACHE_TTL = 900
 
     def __init__(self):
         self._cache      = {}
         self._cache_time = {}
+        self.ohlcv       = OHLCVFeed()
 
     def _is_fresh(self, key: str) -> bool:
         return (key in self._cache and
                 time.time() - self._cache_time.get(key, 0) < self.CACHE_TTL)
 
     def get_vix(self) -> float:
-        if self._is_fresh("vix"):
-            return self._cache["vix"]
+        """
+        Proxy VIX using BTC realized volatility.
+        High BTC vol = risk-off environment.
+        Returns a VIX-equivalent number (roughly scaled).
+        """
+        if self._is_fresh("vix_proxy"):
+            return self._cache["vix_proxy"]
         try:
-            vix = yf.Ticker("^VIX").fast_info["last_price"]
-            self._cache["vix"]      = float(vix)
-            self._cache_time["vix"] = time.time()
-            return self._cache["vix"]
+            df = self.ohlcv.get_candles("BTCUSDT", "1D", 30)
+            if df.empty:
+                return 20.0
+            returns  = df["close"].pct_change().dropna()
+            realized = returns.std() * (365 ** 0.5) * 100
+            # Scale to VIX-like number (BTC vol ~3x traditional VIX)
+            vix_proxy = realized / 3.0
+            self._cache["vix_proxy"]      = float(vix_proxy)
+            self._cache_time["vix_proxy"] = time.time()
+            log.debug(f"VIX proxy (BTC realized vol): {vix_proxy:.1f}")
+            return self._cache["vix_proxy"]
         except Exception as e:
-            log.error(f"VIX fetch failed: {e}")
+            log.error(f"VIX proxy failed: {e}")
             return 20.0
 
     def get_dxy_momentum(self, period: int = 10) -> float:
-        if self._is_fresh("dxy"):
-            return self._cache["dxy"]
+        """
+        Proxy DXY using inverse BTC momentum.
+        BTC up = DXY likely weak = risk-on (negative value returned).
+        """
+        if self._is_fresh("dxy_proxy"):
+            return self._cache["dxy_proxy"]
         try:
-            df = yf.Ticker("DX-Y.NYB").history(period="30d", interval="1d")
+            df = self.ohlcv.get_candles("BTCUSDT", "1D", 30)
             if len(df) >= period:
-                mom = (df["Close"].iloc[-1] - df["Close"].iloc[-period]) / df["Close"].iloc[-period]
-                self._cache["dxy"]      = float(mom)
-                self._cache_time["dxy"] = time.time()
-                return self._cache["dxy"]
+                btc_mom  = (df["close"].iloc[-1] - df["close"].iloc[-period]) / df["close"].iloc[-period]
+                dxy_proxy = -btc_mom   # Inverse relationship
+                self._cache["dxy_proxy"]      = float(dxy_proxy)
+                self._cache_time["dxy_proxy"] = time.time()
+                return self._cache["dxy_proxy"]
         except Exception as e:
-            log.error(f"DXY fetch failed: {e}")
+            log.error(f"DXY proxy failed: {e}")
         return 0.0
 
     def get_yield_curve_slope(self) -> float:
-        if self._is_fresh("yield_curve"):
-            return self._cache["yield_curve"]
-        try:
-            t10    = yf.Ticker("^TNX").fast_info["last_price"]
-            t2     = yf.Ticker("^IRX").fast_info["last_price"]
-            spread = float(t10) - float(t2)
-            self._cache["yield_curve"]      = spread
-            self._cache_time["yield_curve"] = time.time()
-            return spread
-        except Exception as e:
-            log.error(f"Yield curve fetch failed: {e}")
+        """Neutral placeholder until futures/macro data added."""
         return 1.0
 
 
@@ -343,7 +329,7 @@ class CryptoSentimentFeed:
 class DataManager:
 
     def __init__(self):
-        log.info("Initializing DataManager...")
+        log.info("Initializing DataManager (Binance mode)...")
         self.ohlcv      = OHLCVFeed()
         self.order_flow = OrderFlowFeed()
         self.macro      = MacroFeed()
@@ -353,10 +339,10 @@ class DataManager:
     def get_all(self, symbol: str) -> dict:
         log.debug(f"Fetching all data for {symbol}...")
 
-        candles = self.ohlcv.get_all_timeframes(symbol)
-
+        candles        = self.ohlcv.get_all_timeframes(symbol)
         cvd_divergence = {"divergence": "none", "strength": 0.0, "description": "N/A"}
-        if symbol in CRYPTO_SYMBOLS and "LTF" in candles:
+
+        if "LTF" in candles:
             close_prices   = candles["LTF"]["close"].values
             cvd_divergence = self.order_flow.get_cvd_divergence(symbol, close_prices)
 
@@ -366,12 +352,10 @@ class DataManager:
             "yield_curve_slope": self.macro.get_yield_curve_slope(),
         }
 
-        sentiment = {"funding_rate": 0.0, "oi": {"oi": 0.0, "oi_change_pct": 0.0}}
-        if symbol in CRYPTO_SYMBOLS:
-            sentiment = {
-                "funding_rate": self.sentiment.get_funding_rate(symbol),
-                "oi":           self.sentiment.get_open_interest(symbol),
-            }
+        sentiment = {
+            "funding_rate": self.sentiment.get_funding_rate(symbol),
+            "oi":           self.sentiment.get_open_interest(symbol),
+        }
 
         return {
             "symbol":         symbol,
