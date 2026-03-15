@@ -1,14 +1,25 @@
 # =============================================================================
-# APEX SYSTEM — main.py (startup test)
+# APEX SYSTEM — main.py
 # =============================================================================
-# Confirms data feed is working on Railway.
-# Full scoring engine will be added once all layers are built.
+# The main loop. Runs continuously, scanning all symbols
+# every SCAN_INTERVAL_SECONDS and firing alerts when
+# the scoring engine finds a high-probability setup.
 # =============================================================================
 
 import time
 import logging
-from data_feed import DataManager
-from config import CRYPTO_SYMBOLS, FUTURES_SYMBOLS, DEBUG_MODE, DRY_RUN
+
+from data_feed     import DataManager
+from scoring_engine import run as score_symbol
+from alert_manager  import send_alert, send_startup_message, send_error_alert
+
+from config import (
+    CRYPTO_SYMBOLS,
+    FUTURES_SYMBOLS,
+    SCAN_INTERVAL_SECONDS,
+    DEBUG_MODE,
+    DRY_RUN,
+)
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG_MODE else logging.INFO,
@@ -16,37 +27,73 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-def main():
-    log.info("=" * 50)
-    log.info("APEX BOT STARTING...")
-    log.info(f"DRY_RUN = {DRY_RUN}")
-    log.info(f"Crypto symbols: {CRYPTO_SYMBOLS}")
-    log.info(f"Futures symbols: {FUTURES_SYMBOLS}")
-    log.info("=" * 50)
+ALL_SYMBOLS = CRYPTO_SYMBOLS + FUTURES_SYMBOLS
 
+
+def scan_symbol(dm: DataManager, symbol: str):
+    """
+    Runs the full APEX pipeline for one symbol.
+    Fetches data → scores all 6 layers → fires alert if threshold met.
+    """
+    try:
+        # 1. Fetch all data
+        data = dm.get_all(symbol)
+
+        # 2. Run scoring engine
+        signal = score_symbol(data)
+
+        # 3. Fire alert if signal exists
+        if signal:
+            log.info(
+                f"SIGNAL: {symbol} | {signal['direction'].upper()} | "
+                f"Score: {signal['score']} | Tier: {signal['tier']}"
+            )
+            send_alert(signal)
+        else:
+            log.debug(f"{symbol} — no signal this scan")
+
+    except Exception as e:
+        log.error(f"Error scanning {symbol}: {e}")
+        send_error_alert(f"Scan error on {symbol}: {e}")
+
+
+def main():
+    log.info("=" * 60)
+    log.info("APEX BOT STARTING — ALL 6 LAYERS ACTIVE")
+    log.info(f"DRY_RUN    : {DRY_RUN}")
+    log.info(f"Symbols    : {ALL_SYMBOLS}")
+    log.info(f"Scan every : {SCAN_INTERVAL_SECONDS}s")
+    log.info("=" * 60)
+
+    # Initialize data manager
     dm = DataManager()
 
-    log.info("Waiting for WebSocket connections...")
-    time.sleep(5)
+    # Give WebSockets time to connect and
+    # receive initial trade data for CVD
+    log.info("Waiting 10s for WebSocket connections to stabilize...")
+    time.sleep(10)
 
-    test_symbol = CRYPTO_SYMBOLS[0]
-    log.info(f"Testing data feed for {test_symbol}...")
+    # Send startup notification
+    send_startup_message()
 
-    data = dm.get_all(test_symbol)
-
-    log.info(f"Timeframes loaded: {list(data['candles'].keys())}")
-    for tf, df in data["candles"].items():
-        if not df.empty:
-            log.info(f"  {tf}: {len(df)} candles | last close: {df['close'].iloc[-1]:.2f}")
-
-    log.info(f"VIX: {data['macro']['vix']:.1f}")
-    log.info(f"CVD divergence: {data['cvd_divergence']['divergence']}")
-    log.info(f"Funding rate: {data['sentiment']['funding_rate']*100:.4f}%")
-    log.info("Data feed confirmed. Awaiting full layer build...")
+    scan_count = 0
 
     while True:
-        time.sleep(60)
-        log.info("Bot alive — awaiting scoring engine...")
+        scan_count += 1
+        log.info(f"--- Scan #{scan_count} | {len(ALL_SYMBOLS)} symbols ---")
+
+        for symbol in ALL_SYMBOLS:
+            scan_symbol(dm, symbol)
+            # Small delay between symbols to avoid
+            # hammering the API
+            time.sleep(2)
+
+        log.info(
+            f"Scan #{scan_count} complete. "
+            f"Next scan in {SCAN_INTERVAL_SECONDS}s..."
+        )
+        time.sleep(SCAN_INTERVAL_SECONDS)
+
 
 if __name__ == "__main__":
     main()
