@@ -9,9 +9,13 @@
 #   - Detects Change of Character (CHoCH) — earliest reversal signal
 #   - Scores swing high/low quality
 #
+# Changes from v1:
+#   - Swing lookback increased from 5 to 8 for cleaner structure detection
+#   - Minimum swing count increased to reduce noise on high-liquidity assets
+#   - BOS confirmation requires close beyond level, not just touch
+#   - Added swing strength filter — small swings ignored
+#
 # Score: 0–20 points
-#   20 = crystal clear structure, BOS confirmed, all TFs agree
-#   0  = choppy, no clear structure, mixed signals
 # =============================================================================
 
 import numpy as np
@@ -20,50 +24,53 @@ import logging
 
 log = logging.getLogger("l1_structure")
 
+# Increased from 5 to 8 — filters out noise on liquid markets like BTC
+SWING_LOOKBACK = 8
+
+# Minimum % move to count as a valid swing
+MIN_SWING_PCT = 0.008   # 0.8%
+
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 
-def find_swing_highs(df: pd.DataFrame, lookback: int = 5) -> pd.Series:
-    """
-    Find swing highs — candles where the high is the highest
-    of the surrounding `lookback` candles on each side.
-    Returns a boolean Series — True at swing high candles.
-    """
+def find_swing_highs(df: pd.DataFrame,
+                     lookback: int = SWING_LOOKBACK) -> pd.Series:
     highs    = df["high"]
     is_swing = pd.Series(False, index=df.index)
 
     for i in range(lookback, len(df) - lookback):
         window = highs.iloc[i - lookback: i + lookback + 1]
         if highs.iloc[i] == window.max():
-            is_swing.iloc[i] = True
+            # Filter out tiny swings
+            avg_price = df["close"].iloc[i]
+            swing_size = (highs.iloc[i] - df["low"].iloc[i]) / avg_price
+            if swing_size >= MIN_SWING_PCT:
+                is_swing.iloc[i] = True
 
     return is_swing
 
 
-def find_swing_lows(df: pd.DataFrame, lookback: int = 5) -> pd.Series:
-    """
-    Find swing lows — candles where the low is the lowest
-    of the surrounding `lookback` candles on each side.
-    Returns a boolean Series — True at swing low candles.
-    """
+def find_swing_lows(df: pd.DataFrame,
+                    lookback: int = SWING_LOOKBACK) -> pd.Series:
     lows     = df["low"]
     is_swing = pd.Series(False, index=df.index)
 
     for i in range(lookback, len(df) - lookback):
         window = lows.iloc[i - lookback: i + lookback + 1]
         if lows.iloc[i] == window.min():
-            is_swing.iloc[i] = True
+            avg_price  = df["close"].iloc[i]
+            swing_size = (df["high"].iloc[i] - lows.iloc[i]) / avg_price
+            if swing_size >= MIN_SWING_PCT:
+                is_swing.iloc[i] = True
 
     return is_swing
 
 
-def get_recent_swings(df: pd.DataFrame, lookback: int = 5, n: int = 5) -> dict:
-    """
-    Returns the last N swing highs and swing lows as price levels.
-    Used to determine trend structure.
-    """
+def get_recent_swings(df: pd.DataFrame,
+                      lookback: int = SWING_LOOKBACK,
+                      n: int = 5) -> dict:
     sh_mask = find_swing_highs(df, lookback)
     sl_mask = find_swing_lows(df, lookback)
 
@@ -83,38 +90,26 @@ def get_recent_swings(df: pd.DataFrame, lookback: int = 5, n: int = 5) -> dict:
 def get_trend_bias(df: pd.DataFrame) -> dict:
     """
     Determines the current trend bias from swing structure.
-
-    Bullish:  Higher Highs (HH) + Higher Lows (HL)
-    Bearish:  Lower Highs (LH) + Lower Lows (LL)
-    Neutral:  Mixed structure
-
-    Returns:
-        {
-            "bias":        "bullish" | "bearish" | "neutral",
-            "strength":    float (0.0–1.0),
-            "description": str
-        }
+    Requires minimum 3 swings to confirm — reduces false signals.
     """
-    if len(df) < 50:
-        return {"bias": "neutral", "strength": 0.0, "description": "Insufficient data"}
+    if len(df) < 80:
+        return {"bias": "neutral", "strength": 0.0,
+                "description": "Insufficient data"}
 
-    swings = get_recent_swings(df, lookback=5, n=4)
+    swings = get_recent_swings(df, lookback=SWING_LOOKBACK, n=4)
     highs  = swings["swing_highs"]
     lows   = swings["swing_lows"]
 
-    if len(highs) < 2 or len(lows) < 2:
-        return {"bias": "neutral", "strength": 0.0, "description": "Not enough swings"}
+    if len(highs) < 3 or len(lows) < 3:
+        return {"bias": "neutral", "strength": 0.0,
+                "description": "Not enough swings"}
 
-    # Check if making higher highs and higher lows
     hh = all(highs[i] > highs[i-1] for i in range(1, len(highs)))
     hl = all(lows[i]  > lows[i-1]  for i in range(1, len(lows)))
-
-    # Check if making lower highs and lower lows
     lh = all(highs[i] < highs[i-1] for i in range(1, len(highs)))
     ll = all(lows[i]  < lows[i-1]  for i in range(1, len(lows)))
 
     if hh and hl:
-        # Measure strength by how consistent the moves are
         high_diffs = [highs[i] - highs[i-1] for i in range(1, len(highs))]
         low_diffs  = [lows[i]  - lows[i-1]  for i in range(1, len(lows))]
         strength   = min(1.0, (np.mean(high_diffs) + np.mean(low_diffs)) /
@@ -136,13 +131,15 @@ def get_trend_bias(df: pd.DataFrame) -> dict:
             "description": f"LH+LL structure confirmed ({len(highs)} swings)"
         }
 
-    # Partial structure
     if hh or hl:
-        return {"bias": "bullish", "strength": 0.3, "description": "Partial bullish structure"}
+        return {"bias": "bullish", "strength": 0.3,
+                "description": "Partial bullish structure"}
     if lh or ll:
-        return {"bias": "bearish", "strength": 0.3, "description": "Partial bearish structure"}
+        return {"bias": "bearish", "strength": 0.3,
+                "description": "Partial bearish structure"}
 
-    return {"bias": "neutral", "strength": 0.0, "description": "No clear structure"}
+    return {"bias": "neutral", "strength": 0.0,
+            "description": "No clear structure"}
 
 
 # =============================================================================
@@ -151,26 +148,14 @@ def get_trend_bias(df: pd.DataFrame) -> dict:
 
 def detect_bos(df: pd.DataFrame) -> dict:
     """
-    Break of Structure — price closes beyond the most recent
-    swing high (bullish BOS) or swing low (bearish BOS).
-
-    A BOS confirms trend continuation — institutions have
-    pushed through a key level and likely have more to go.
-
-    Returns:
-        {
-            "bos":         "bullish" | "bearish" | "none",
-            "level":       float (the broken level),
-            "description": str
-        }
+    Break of Structure — price CLOSES beyond the most recent swing high/low.
+    Requires a candle close, not just a wick — reduces fakeout signals.
     """
-    if len(df) < 20:
+    if len(df) < 30:
         return {"bos": "none", "level": 0.0, "description": "Insufficient data"}
 
-    swings      = get_recent_swings(df, lookback=5, n=3)
-    last_close  = df["close"].iloc[-1]
-    last_high   = df["high"].iloc[-1]
-    last_low    = df["low"].iloc[-1]
+    swings     = get_recent_swings(df, lookback=SWING_LOOKBACK, n=3)
+    last_close = df["close"].iloc[-1]
 
     if len(swings["swing_highs"]) > 0:
         prev_swing_high = swings["swing_highs"][-1]
@@ -199,30 +184,16 @@ def detect_bos(df: pd.DataFrame) -> dict:
 
 def detect_choch(df: pd.DataFrame, trend_bias: str) -> dict:
     """
-    Change of Character — the FIRST sign that a trend is reversing.
-    In a bullish trend: price breaks below the most recent Higher Low
-    In a bearish trend: price breaks above the most recent Lower High
-
-    This is the earliest possible reversal signal — it happens BEFORE
-    a full structure shift, giving you early entry on reversals.
-
-    Returns:
-        {
-            "choch":       True | False,
-            "direction":   "bullish" | "bearish" | "none",
-            "level":       float,
-            "description": str
-        }
+    Change of Character — first sign of trend reversal.
     """
-    if len(df) < 20 or trend_bias == "neutral":
+    if len(df) < 30 or trend_bias == "neutral":
         return {"choch": False, "direction": "none", "level": 0.0,
                 "description": "No CHoCH — neutral structure"}
 
-    swings     = get_recent_swings(df, lookback=5, n=3)
+    swings     = get_recent_swings(df, lookback=SWING_LOOKBACK, n=3)
     last_close = df["close"].iloc[-1]
 
     if trend_bias == "bullish" and len(swings["swing_lows"]) > 0:
-        # In bullish trend — break of recent HL = CHoCH bearish
         recent_hl = swings["swing_lows"][-1]
         if last_close < recent_hl:
             return {
@@ -233,7 +204,6 @@ def detect_choch(df: pd.DataFrame, trend_bias: str) -> dict:
             }
 
     if trend_bias == "bearish" and len(swings["swing_highs"]) > 0:
-        # In bearish trend — break of recent LH = CHoCH bullish
         recent_lh = swings["swing_highs"][-1]
         if last_close > recent_lh:
             return {
@@ -252,17 +222,6 @@ def detect_choch(df: pd.DataFrame, trend_bias: str) -> dict:
 # =============================================================================
 
 def get_mtf_agreement(candles: dict) -> dict:
-    """
-    Checks if structure bias agrees across all timeframes.
-    More agreement = stronger signal.
-
-    Returns:
-        {
-            "agreement":    "bullish" | "bearish" | "mixed",
-            "score":        int (0–3, how many TFs agree),
-            "description":  str
-        }
-    """
     biases = {}
     for tf_name, df in candles.items():
         if not df.empty:
@@ -290,7 +249,8 @@ def get_mtf_agreement(candles: dict) -> dict:
     return {
         "agreement":   "mixed",
         "score":       max(bullish_count, bearish_count),
-        "description": f"Mixed — {bullish_count} bull, {bearish_count} bear of {total} TFs"
+        "description": f"Mixed — {bullish_count} bull, "
+                       f"{bearish_count} bear of {total} TFs"
     }
 
 
@@ -301,9 +261,6 @@ def get_mtf_agreement(candles: dict) -> dict:
 def score(data: dict) -> dict:
     """
     Main entry point — called by scoring_engine.py
-
-    Takes the full data dict from DataManager.get_all()
-    Returns a standardized score dict.
 
     Score breakdown (max 20):
         HTF bias clear:          +6
@@ -316,46 +273,42 @@ def score(data: dict) -> dict:
     if not candles:
         return _empty_score("No candle data available")
 
-    htf_df  = candles.get("HTF", pd.DataFrame())
-    mtf_df  = candles.get("MTF", pd.DataFrame())
-    ltf_df  = candles.get("LTF", pd.DataFrame())
+    htf_df = candles.get("HTF", pd.DataFrame())
+    mtf_df = candles.get("MTF", pd.DataFrame())
+    ltf_df = candles.get("LTF", pd.DataFrame())
 
     if htf_df.empty:
         return _empty_score("No HTF data")
 
-    # --- HTF trend bias ---
-    htf_bias = get_trend_bias(htf_df)
-    mtf_bias = get_trend_bias(mtf_df) if not mtf_df.empty else {"bias": "neutral", "strength": 0.0}
-
-    # --- BOS on MTF ---
-    bos = detect_bos(mtf_df) if not mtf_df.empty else {"bos": "none"}
-
-    # --- CHoCH on LTF ---
-    choch = detect_choch(ltf_df, htf_bias["bias"]) if not ltf_df.empty else {"choch": False, "direction": "none"}
-
-    # --- MTF agreement ---
+    htf_bias      = get_trend_bias(htf_df)
+    mtf_bias      = get_trend_bias(mtf_df) if not mtf_df.empty else \
+                    {"bias": "neutral", "strength": 0.0}
+    bos           = detect_bos(mtf_df) if not mtf_df.empty else \
+                    {"bos": "none"}
+    choch         = detect_choch(ltf_df, htf_bias["bias"]) \
+                    if not ltf_df.empty else \
+                    {"choch": False, "direction": "none"}
     mtf_agreement = get_mtf_agreement(candles)
 
-    # --- Build score ---
-    points = 0
+    points  = 0
     reasons = []
 
     # HTF bias (max 6)
     if htf_bias["bias"] != "neutral":
         bias_points = int(6 * htf_bias["strength"])
         bias_points = max(2, min(6, bias_points))
-        points += bias_points
-        reasons.append(f"HTF {htf_bias['bias']} ({htf_bias['description']})")
+        points     += bias_points
+        reasons.append(f"HTF {htf_bias['bias']} "
+                       f"({htf_bias['description']})")
 
     # MTF agreement (max 4)
     if mtf_agreement["agreement"] != "mixed":
         agree_points = min(4, mtf_agreement["score"])
-        points += agree_points
+        points      += agree_points
         reasons.append(f"MTF agreement: {mtf_agreement['description']}")
 
     # BOS (max 6)
     if bos["bos"] != "none":
-        # Full points only if BOS direction matches HTF bias
         if bos["bos"] == htf_bias["bias"]:
             points += 6
             reasons.append(f"BOS confirmed: {bos['description']}")
@@ -368,7 +321,7 @@ def score(data: dict) -> dict:
         points += 4
         reasons.append(f"CHoCH: {choch['description']}")
 
-    # Determine signal direction
+    # Direction
     if htf_bias["bias"] == "bullish" and bos.get("bos") == "bullish":
         direction = "long"
     elif htf_bias["bias"] == "bearish" and bos.get("bos") == "bearish":
@@ -380,7 +333,8 @@ def score(data: dict) -> dict:
 
     points = min(20, points)
 
-    log.debug(f"L1 score: {points}/20 | direction: {direction} | {' | '.join(reasons)}")
+    log.debug(f"L1 score: {points}/20 | direction: {direction} | "
+              f"{' | '.join(reasons)}")
 
     return {
         "layer":     "L1_structure",
@@ -389,10 +343,10 @@ def score(data: dict) -> dict:
         "direction": direction,
         "reasons":   reasons,
         "details": {
-            "htf_bias":     htf_bias,
-            "mtf_bias":     mtf_bias,
-            "bos":          bos,
-            "choch":        choch,
+            "htf_bias":      htf_bias,
+            "mtf_bias":      mtf_bias,
+            "bos":           bos,
+            "choch":         choch,
             "mtf_agreement": mtf_agreement,
         }
     }
