@@ -57,7 +57,7 @@ log = logging.getLogger("backtest")
 # SETTINGS
 # =============================================================================
 
-BACKTEST_DAYS     = 730        # 2 years
+BACKTEST_DAYS     = 365        # 1 year
 WARMUP_CANDLES    = 250        # Candles needed before scoring starts
                                # (EMAs need history to be accurate)
 STEP_CANDLES      = 4          # Check every 4 candles on 4H (= every 16hrs)
