@@ -59,7 +59,7 @@ log = logging.getLogger("backtest")
 
 BACKTEST_DAYS     = 365        # 1 year
 WARMUP_CANDLES    = 250        # Candles needed before scoring starts
-BACKTEST_SCORE_THRESHOLD = 45  # Lower than live — accounts for no live CVD
+BACKTEST_SCORE_THRESHOLD = 25  # Lower than live — accounts for no live CVD
 STEP_CANDLES      = 4          # Check every 4 candles on 4H (= every 16hrs)
                                # Balances thoroughness vs speed
 FORWARD_CANDLES   = 100        # How many candles forward to check for outcome
@@ -174,7 +174,13 @@ def build_candles_at_point(
 # =============================================================================
 # SCORING AT A POINT IN TIME
 # =============================================================================
-
+def layer_lookup_score(layer_results: list, layer_name: str) -> int:
+    """Helper to get a specific layer score from results list."""
+    for r in layer_results:
+        if r["layer"] == layer_name:
+            return r["score"]
+    return 0
+    
 def score_at_point(candles: dict, symbol: str) -> dict:
     """
     Runs all 6 layers at a specific point in time.
@@ -228,10 +234,16 @@ def score_at_point(candles: dict, symbol: str) -> dict:
     consensus   = get_direction_consensus(layer_results)
     direction   = consensus["direction"]
 
+    # Always log scores above 20 so we can see what's being generated
+    if total_score >= 20 and direction != "neutral":
+        log.info(f"Score: {symbol} {total_score}/100 {direction} "
+                 f"L1:{layer_lookup_score(layer_results,'L1_structure')} "
+                 f"L3:{layer_lookup_score(layer_results,'L3_zones')} "
+                 f"L4:{layer_lookup_score(layer_results,'L4_macro')} "
+                 f"L5:{layer_lookup_score(layer_results,'L5_momentum')}")
+
     if total_score < BACKTEST_SCORE_THRESHOLD or direction == "neutral":
         return None
-
-    log.info(f"Signal candidate: {symbol} score:{total_score} dir:{direction}")
 
     # Calculate trade levels
     levels = calculate_trade_levels(data, direction)
