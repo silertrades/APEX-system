@@ -4,19 +4,21 @@
 # Layer 4: Macro + Volatility Regime
 #
 # What this does:
-#   - Reads the volatility environment (VIX proxy from BTC realized vol)
+#   - Reads real VIX from yfinance (falls back to BTC vol proxy)
+#   - Reads real DXY from yfinance (falls back to inverse BTC momentum)
+#   - Reads real yield curve from yfinance (10Y - 5Y spread)
 #   - Determines risk-on vs risk-off regime
-#   - Detects trend vs mean-reversion market conditions
-#   - Classifies the current regime for position sizing
+#   - Classifies trending vs mean-reverting conditions
+#     (threshold lowered from 0.6 to 0.45 based on backtest results)
 #
 # Score: 0–15 points
-#   15 = macro strongly supports the trade direction
-#   0  = macro is working against the trade
 # =============================================================================
 
+import time
+import logging
+import yfinance as yf
 import numpy as np
 import pandas as pd
-import logging
 
 from config import (
     VIX_RISK_OFF_THRESHOLD,
@@ -31,21 +33,6 @@ log = logging.getLogger("l4_macro")
 # =============================================================================
 
 def classify_vol_regime(vix: float) -> dict:
-    """
-    Classifies the volatility environment.
-
-    Low vol  (VIX < 15): Trending, momentum strategies work best
-    Mid vol  (VIX 15-25): Normal, all strategies viable
-    High vol (VIX > 25): Mean reversion, reduce size, be selective
-    Extreme  (VIX > 35): Crisis mode, only short or cash
-
-    Returns:
-        {
-            "regime":      "low" | "mid" | "high" | "extreme",
-            "risk_on":     bool,
-            "description": str
-        }
-    """
     if vix < 15:
         return {
             "regime":      "low",
@@ -82,23 +69,9 @@ def classify_vol_regime(vix: float) -> dict:
 
 def classify_market_regime(df: pd.DataFrame, period: int = 20) -> dict:
     """
-    Determines if the market is trending or mean-reverting
-    using the ADX concept (simplified) and Hurst exponent proxy.
-
-    Trending:       Price making consistent directional moves
-    Mean-reverting: Price oscillating around a mean
-
-    Uses a simplified approach:
-    - Calculate the ratio of absolute price change to total path length
-    - High ratio = trending (efficient movement)
-    - Low ratio  = mean reverting (choppy, inefficient)
-
-    Returns:
-        {
-            "regime":      "trending" | "mean_reverting" | "neutral",
-            "strength":    float (0.0–1.0),
-            "description": str
-        }
+    Determines if the market is trending or mean-reverting.
+    Threshold lowered from 0.6 to 0.45 based on backtest results —
+    the original threshold almost never classified trend mode.
     """
     if len(df) < period * 2:
         return {
@@ -107,9 +80,7 @@ def classify_market_regime(df: pd.DataFrame, period: int = 20) -> dict:
             "description": "Insufficient data for regime classification"
         }
 
-    recent = df["close"].tail(period).values
-
-    # Net displacement vs total path
+    recent     = df["close"].tail(period).values
     net_move   = abs(recent[-1] - recent[0])
     total_path = sum(abs(recent[i] - recent[i-1])
                      for i in range(1, len(recent)))
@@ -123,14 +94,14 @@ def classify_market_regime(df: pd.DataFrame, period: int = 20) -> dict:
 
     efficiency = net_move / total_path
 
-    if efficiency >= 0.6:
+    if efficiency >= 0.45:
         return {
             "regime":      "trending",
             "strength":    round(efficiency, 3),
             "description": f"Trending market (efficiency: {efficiency:.2f}) "
                            f"— momentum strategies favored"
         }
-    elif efficiency <= 0.3:
+    elif efficiency <= 0.25:
         return {
             "regime":      "mean_reverting",
             "strength":    round(1 - efficiency, 3),
@@ -147,23 +118,10 @@ def classify_market_regime(df: pd.DataFrame, period: int = 20) -> dict:
 
 
 # =============================================================================
-# DXY REGIME (CRYPTO PROXY)
+# DXY REGIME
 # =============================================================================
 
 def classify_dxy_regime(dxy_momentum: float) -> dict:
-    """
-    Classifies the DXY (dollar) environment.
-    For crypto we use inverse BTC momentum as a proxy.
-
-    Strong dollar (DXY up) = risk-off = headwind for crypto longs
-    Weak dollar  (DXY dn)  = risk-on  = tailwind for crypto longs
-
-    Returns:
-        {
-            "regime":      "risk_on" | "risk_off" | "neutral",
-            "description": str
-        }
-    """
     if dxy_momentum < -0.02:
         return {
             "regime":      "risk_on",
@@ -189,17 +147,6 @@ def classify_dxy_regime(dxy_momentum: float) -> dict:
 # =============================================================================
 
 def classify_yield_curve(slope: float) -> dict:
-    """
-    Classifies the yield curve environment.
-    Currently returns neutral for crypto-only mode.
-    Will be enhanced when futures data is added.
-
-    Returns:
-        {
-            "regime":      "normal" | "flat" | "inverted",
-            "description": str
-        }
-    """
     if slope > 1.0:
         return {
             "regime":      "normal",
@@ -221,31 +168,19 @@ def classify_yield_curve(slope: float) -> dict:
 
 
 # =============================================================================
-# OVERALL REGIME CLASSIFIER
+# OVERALL REGIME
 # =============================================================================
 
 def get_overall_regime(vol_regime: dict,
                        market_regime: dict,
                        dxy_regime: dict,
                        yield_regime: dict) -> dict:
-    """
-    Combines all regime signals into one overall classification.
+    is_risk_on   = vol_regime["risk_on"]
+    is_trending  = market_regime["regime"] == "trending"
+    is_mean_rev  = market_regime["regime"] == "mean_reverting"
+    is_crisis    = vol_regime["regime"] == "extreme"
+    dxy_risk_off = dxy_regime["regime"] == "risk_off"
 
-    Returns:
-        {
-            "mode":        "trend" | "mean_reversion" | "breakout" | "avoid",
-            "risk_level":  "low" | "medium" | "high",
-            "description": str
-        }
-    """
-    is_risk_on    = vol_regime["risk_on"]
-    is_trending   = market_regime["regime"] == "trending"
-    is_mean_rev   = market_regime["regime"] == "mean_reverting"
-    is_crisis     = vol_regime["regime"] == "extreme"
-    dxy_risk_on   = dxy_regime["regime"] == "risk_on"
-    dxy_risk_off  = dxy_regime["regime"] == "risk_off"
-
-    # Crisis — avoid or short only
     if is_crisis:
         return {
             "mode":        "avoid",
@@ -253,7 +188,6 @@ def get_overall_regime(vol_regime: dict,
             "description": "Crisis conditions — avoid longs, reduce all exposure"
         }
 
-    # Best conditions: low vol + trending + risk on
     if is_risk_on and is_trending and not dxy_risk_off:
         return {
             "mode":        "trend",
@@ -261,7 +195,6 @@ def get_overall_regime(vol_regime: dict,
             "description": "Ideal trend conditions — full size momentum entries"
         }
 
-    # Mean reversion conditions
     if is_risk_on and is_mean_rev:
         return {
             "mode":        "mean_reversion",
@@ -270,7 +203,6 @@ def get_overall_regime(vol_regime: dict,
                            "tight targets"
         }
 
-    # High vol trending — breakout mode
     if not is_risk_on and is_trending:
         return {
             "mode":        "breakout",
@@ -279,13 +211,134 @@ def get_overall_regime(vol_regime: dict,
                            "wider stops"
         }
 
-    # Default
     return {
         "mode":        "mean_reversion",
         "risk_level":  "medium",
-        "description": "Mixed conditions — selective entries, "
-                       "reduced size"
+        "description": "Mixed conditions — selective entries, reduced size"
     }
+
+
+# =============================================================================
+# MACRO DATA FETCHER
+# =============================================================================
+
+class MacroFeed:
+    """
+    Fetches macro data via yfinance with intelligent fallbacks.
+    Cached for 15 minutes — macro data moves slowly.
+    """
+
+    CACHE_TTL = 900
+
+    def __init__(self):
+        self._cache      = {}
+        self._cache_time = {}
+
+    def _is_fresh(self, key: str) -> bool:
+        return (key in self._cache and
+                time.time() - self._cache_time.get(key, 0) < self.CACHE_TTL)
+
+    def get_vix(self) -> float:
+        """
+        Real VIX from yfinance. Falls back to BTC realized vol proxy.
+        """
+        if self._is_fresh("vix"):
+            return self._cache["vix"]
+
+        # Try real VIX
+        try:
+            vix = yf.Ticker("^VIX").fast_info["last_price"]
+            self._cache["vix"]      = float(vix)
+            self._cache_time["vix"] = time.time()
+            log.debug(f"VIX (real): {self._cache['vix']:.1f}")
+            return self._cache["vix"]
+        except Exception as e:
+            log.debug(f"Real VIX unavailable ({e}) — using BTC proxy")
+
+        # Fall back to BTC realized vol proxy
+        try:
+            df = yf.Ticker("BTC-USD").history(period="30d", interval="1d")
+            if not df.empty:
+                returns   = df["Close"].pct_change().dropna()
+                realized  = returns.std() * (365 ** 0.5) * 100
+                vix_proxy = realized / 3.0
+                self._cache["vix"]      = float(vix_proxy)
+                self._cache_time["vix"] = time.time()
+                log.debug(f"VIX (BTC proxy): {vix_proxy:.1f}")
+                return self._cache["vix"]
+        except Exception as e2:
+            log.error(f"VIX proxy failed: {e2}")
+
+        return 20.0
+
+    def get_dxy_momentum(self, period: int = DXY_MOMENTUM_PERIOD) -> float:
+        """
+        Real DXY momentum from yfinance. Falls back to inverse BTC momentum.
+        """
+        if self._is_fresh("dxy"):
+            return self._cache["dxy"]
+
+        # Try real DXY
+        try:
+            df = yf.Ticker("DX-Y.NYB").history(period="30d", interval="1d")
+            if len(df) >= period:
+                momentum = (df["Close"].iloc[-1] - df["Close"].iloc[-period]) \
+                           / df["Close"].iloc[-period]
+                self._cache["dxy"]      = float(momentum)
+                self._cache_time["dxy"] = time.time()
+                log.debug(f"DXY (real): {momentum*100:.2f}%")
+                return self._cache["dxy"]
+        except Exception as e:
+            log.debug(f"Real DXY unavailable ({e}) — using BTC proxy")
+
+        # Fall back to inverse BTC momentum
+        try:
+            df = yf.Ticker("BTC-USD").history(period="30d", interval="1d")
+            if len(df) >= period:
+                btc_mom   = (df["Close"].iloc[-1] - df["Close"].iloc[-period]) \
+                            / df["Close"].iloc[-period]
+                dxy_proxy = -btc_mom
+                self._cache["dxy"]      = float(dxy_proxy)
+                self._cache_time["dxy"] = time.time()
+                log.debug(f"DXY (BTC proxy): {dxy_proxy*100:.2f}%")
+                return self._cache["dxy"]
+        except Exception as e:
+            log.error(f"DXY proxy failed: {e}")
+
+        return 0.0
+
+    def get_yield_curve_slope(self) -> float:
+        """
+        Real yield curve (10Y - 5Y) from yfinance.
+        Slightly delayed but yield curve moves slowly — acceptable.
+        Falls back to 10Y minus fixed estimate if 5Y unavailable.
+        """
+        if self._is_fresh("yield_curve"):
+            return self._cache["yield_curve"]
+
+        try:
+            t10    = yf.Ticker("^TNX").fast_info["last_price"]
+            t5     = yf.Ticker("^FVX").fast_info["last_price"]
+            spread = float(t10) - float(t5)
+            self._cache["yield_curve"]      = spread
+            self._cache_time["yield_curve"] = time.time()
+            log.debug(f"Yield curve: {spread:.2f} "
+                      f"(10Y:{float(t10):.2f} 5Y:{float(t5):.2f})")
+            return spread
+        except Exception as e:
+            log.debug(f"Yield curve fetch failed ({e}) — trying fallback")
+
+        try:
+            t10    = yf.Ticker("^TNX").fast_info["last_price"]
+            spread = float(t10) - 4.0
+            self._cache["yield_curve"]      = spread
+            self._cache_time["yield_curve"] = time.time()
+            log.debug(f"Yield curve (approx): {spread:.2f}")
+            return spread
+        except Exception as e2:
+            log.error(f"Yield curve fallback failed: {e2}")
+
+        return 1.0
 
 
 # =============================================================================
@@ -302,15 +355,14 @@ def score(data: dict) -> dict:
         DXY regime supports trade:    +3
         Yield curve supports trade:   +3
     """
-    macro     = data.get("macro", {})
-    candles   = data.get("candles", {})
-    mtf_df    = candles.get("MTF", pd.DataFrame())
+    macro   = data.get("macro", {})
+    candles = data.get("candles", {})
+    mtf_df  = candles.get("MTF", pd.DataFrame())
 
-    vix       = macro.get("vix", 20.0)
-    dxy_mom   = macro.get("dxy_momentum", 0.0)
-    yc_slope  = macro.get("yield_curve_slope", 1.0)
+    vix      = macro.get("vix", 20.0)
+    dxy_mom  = macro.get("dxy_momentum", 0.0)
+    yc_slope = macro.get("yield_curve_slope", 1.0)
 
-    # --- Classify regimes ---
     vol_regime    = classify_vol_regime(vix)
     market_regime = classify_market_regime(mtf_df) if not mtf_df.empty else \
                     {"regime": "neutral", "strength": 0.5,
@@ -320,7 +372,6 @@ def score(data: dict) -> dict:
     overall       = get_overall_regime(vol_regime, market_regime,
                                        dxy_regime, yield_regime)
 
-    # --- Build score ---
     points    = 0
     reasons   = []
     direction = "neutral"
@@ -336,8 +387,6 @@ def score(data: dict) -> dict:
         points += 1
         reasons.append(f"Vol regime: {vol_regime['description']}")
     else:
-        # Extreme vol — macro is working against us
-        points += 0
         reasons.append(f"Vol regime: {vol_regime['description']}")
 
     # Market regime (max 4)
@@ -353,14 +402,13 @@ def score(data: dict) -> dict:
 
     # DXY regime (max 3)
     if dxy_regime["regime"] == "risk_on":
-        points += 3
+        points   += 3
         direction = "long"
         reasons.append(f"DXY: {dxy_regime['description']}")
     elif dxy_regime["regime"] == "neutral":
         points += 2
         reasons.append(f"DXY: {dxy_regime['description']}")
     else:
-        points += 0
         reasons.append(f"DXY: {dxy_regime['description']}")
 
     # Yield curve (max 3)
@@ -371,7 +419,6 @@ def score(data: dict) -> dict:
         points += 1
         reasons.append(f"Yield curve: {yield_regime['description']}")
     else:
-        points += 0
         reasons.append(f"Yield curve: {yield_regime['description']}")
 
     points = min(15, points)
