@@ -5,11 +5,10 @@
 #
 # Scoring audit changes:
 #   - RSI overbought no longer penalizes in trending conditions
-#   - RSI overbought/oversold now ADDS points as confirmation
-#     (overbought in uptrend = strong momentum, not a warning)
+#   - RSI overbought/oversold now ADDS points as confirmation in trends
+#   - Regime detected from price efficiency (matches L4 method)
 #   - MACD scoring more graduated
 #   - EMA alignment scoring more generous for partial alignment
-#   - Overall: should score 8-12/15 in trending conditions
 #
 # Score: 0-15 points
 # =============================================================================
@@ -74,19 +73,31 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(com=period - 1, adjust=False).mean()
 
 
+def detect_regime(df: pd.DataFrame, period: int = 20) -> str:
+    """
+    Detects trend vs neutral regime using price efficiency.
+    Same method as L4 so both layers agree on regime.
+    """
+    if df.empty or len(df) < period:
+        return "neutral"
+    recent     = df["close"].tail(period).values
+    net_move   = abs(recent[-1] - recent[0])
+    total_path = sum(abs(recent[i] - recent[i-1])
+                     for i in range(1, len(recent)))
+    if total_path == 0:
+        return "neutral"
+    efficiency = net_move / total_path
+    return "trend" if efficiency >= 0.45 else "neutral"
+
+
 # =============================================================================
 # EMA STACK ALIGNMENT
 # =============================================================================
 
 def check_ema_alignment(df: pd.DataFrame) -> dict:
-    """
-    Checks EMA stack alignment.
-    Now awards partial points for 2/4 or 3/4 alignment.
-    """
     if len(df) < EMA_ANCHOR + 10:
         return {"aligned": "none", "strength": 0.0,
-                "count": 0,
-                "description": "Insufficient data"}
+                "count": 0, "description": "Insufficient data"}
 
     close  = df["close"]
     ema9   = calc_ema(close, EMA_FAST).iloc[-1]
@@ -112,61 +123,35 @@ def check_ema_alignment(df: pd.DataFrame) -> dict:
     if bull_count == 4:
         spread   = (ema9 - ema200) / price
         strength = min(1.0, spread * 20)
-        return {
-            "aligned":     "bullish",
-            "strength":    round(strength, 3),
-            "count":       4,
-            "description": f"Perfect bullish EMA stack (4/4)"
-        }
+        return {"aligned": "bullish", "strength": round(strength, 3),
+                "count": 4, "description": "Perfect bullish EMA stack (4/4)"}
 
     if bear_count == 4:
         spread   = (ema200 - ema9) / price
         strength = min(1.0, spread * 20)
-        return {
-            "aligned":     "bearish",
-            "strength":    round(strength, 3),
-            "count":       4,
-            "description": f"Perfect bearish EMA stack (4/4)"
-        }
+        return {"aligned": "bearish", "strength": round(strength, 3),
+                "count": 4, "description": "Perfect bearish EMA stack (4/4)"}
 
     if bull_count >= 3:
-        return {
-            "aligned":     "bullish",
-            "strength":    round(bull_count / 4, 3),
-            "count":       bull_count,
-            "description": f"Bullish EMA alignment ({bull_count}/4)"
-        }
+        return {"aligned": "bullish", "strength": round(bull_count / 4, 3),
+                "count": bull_count,
+                "description": f"Bullish EMA alignment ({bull_count}/4)"}
 
     if bear_count >= 3:
-        return {
-            "aligned":     "bearish",
-            "strength":    round(bear_count / 4, 3),
-            "count":       bear_count,
-            "description": f"Bearish EMA alignment ({bear_count}/4)"
-        }
+        return {"aligned": "bearish", "strength": round(bear_count / 4, 3),
+                "count": bear_count,
+                "description": f"Bearish EMA alignment ({bear_count}/4)"}
 
     if bull_count == 2:
-        return {
-            "aligned":     "bullish",
-            "strength":    0.3,
-            "count":       2,
-            "description": f"Weak bullish EMA alignment (2/4)"
-        }
+        return {"aligned": "bullish", "strength": 0.3, "count": 2,
+                "description": "Weak bullish EMA alignment (2/4)"}
 
     if bear_count == 2:
-        return {
-            "aligned":     "bearish",
-            "strength":    0.3,
-            "count":       2,
-            "description": f"Weak bearish EMA alignment (2/4)"
-        }
+        return {"aligned": "bearish", "strength": 0.3, "count": 2,
+                "description": "Weak bearish EMA alignment (2/4)"}
 
-    return {
-        "aligned":     "none",
-        "strength":    0.0,
-        "count":       0,
-        "description": "EMA stack mixed"
-    }
+    return {"aligned": "none", "strength": 0.0, "count": 0,
+            "description": "EMA stack mixed"}
 
 
 # =============================================================================
@@ -190,138 +175,89 @@ def check_mtf_ema_alignment(candles: dict) -> dict:
     total = len(results)
 
     if bull_count >= TF_ALIGNMENT_MIN:
-        return {
-            "direction":   "bullish",
-            "count":       bull_count,
-            "total":       total,
-            "description": f"Bullish EMA alignment on {bull_count}/{total} TFs",
-            "by_tf":       results,
-        }
+        return {"direction": "bullish", "count": bull_count, "total": total,
+                "description": f"Bullish EMA alignment on {bull_count}/{total} TFs",
+                "by_tf": results}
 
     if bear_count >= TF_ALIGNMENT_MIN:
-        return {
-            "direction":   "bearish",
-            "count":       bear_count,
-            "total":       total,
-            "description": f"Bearish EMA alignment on {bear_count}/{total} TFs",
-            "by_tf":       results,
-        }
+        return {"direction": "bearish", "count": bear_count, "total": total,
+                "description": f"Bearish EMA alignment on {bear_count}/{total} TFs",
+                "by_tf": results}
 
     dominant = "bullish" if bull_count >= bear_count else "bearish"
-    return {
-        "direction":   dominant,
-        "count":       max(bull_count, bear_count),
-        "total":       total,
-        "description": f"Partial {dominant} EMA — "
-                       f"{bull_count} bull, {bear_count} bear of {total} TFs",
-        "by_tf":       results,
-    }
+    return {"direction": dominant, "count": max(bull_count, bear_count),
+            "total": total,
+            "description": f"Partial {dominant} EMA — "
+                           f"{bull_count} bull, {bear_count} bear of {total} TFs",
+            "by_tf": results}
 
 
 # =============================================================================
 # RSI ANALYSIS — trending aware
 # =============================================================================
 
-def analyze_rsi(df: pd.DataFrame, direction: str,
-                regime: str = "neutral") -> dict:
+def analyze_rsi(df: pd.DataFrame, direction: str, regime: str) -> dict:
     """
     RSI analysis that understands trending conditions.
 
-    In a TRENDING market:
-      - Overbought (>70) on a LONG signal = strong momentum, ADD points
-      - Oversold  (<30) on a SHORT signal = strong momentum, ADD points
-      - Overbought on a SHORT = caution, small penalty
-      - Oversold   on a LONG  = caution, small penalty
+    In TREND regime:
+      - Overbought on LONG  = strong momentum, +2 points
+      - Oversold  on SHORT  = strong momentum, +2 points
+      - Overbought on SHORT = mild confirmation, +1 point
+      - Oversold  on LONG   = mild confirmation, +1 point
 
-    In a NON-TRENDING market:
-      - Overbought = caution on longs (original behavior)
-      - Oversold   = caution on shorts (original behavior)
-
-    Returns:
-        {
-            "value":       float,
-            "condition":   str,
-            "points":      int  (+2 to -1),
-            "description": str
-        }
+    In NEUTRAL regime:
+      - Overbought on LONG  = caution, -1 point
+      - Oversold  on SHORT  = caution, -1 point
+      - Overbought on SHORT = confirmation, +1 point
+      - Oversold  on LONG   = confirmation, +1 point
     """
     if len(df) < RSI_PERIOD + 5:
         return {"value": 50.0, "condition": "neutral",
                 "points": 0, "description": "Insufficient data"}
 
-    rsi_val   = calc_rsi(df["close"], RSI_PERIOD).iloc[-1]
-    is_trend  = regime in ["trend", "trending", "low"]
+    rsi_val  = calc_rsi(df["close"], RSI_PERIOD).iloc[-1]
+    is_trend = regime == "trend"
 
     if rsi_val >= RSI_OVERBOUGHT:
         if direction == "long" and is_trend:
-            # Overbought in uptrend = strong momentum confirmation
-            return {
-                "value":       round(rsi_val, 1),
-                "condition":   "overbought_trending",
-                "points":      2,
-                "description": f"RSI overbought ({rsi_val:.1f}) in trend "
-                               f"— strong momentum confirmation"
-            }
+            return {"value": round(rsi_val, 1),
+                    "condition": "overbought_trending", "points": 2,
+                    "description": f"RSI overbought ({rsi_val:.1f}) in trend "
+                                   f"— strong momentum confirmation"}
         elif direction == "short":
-            # Overbought = good for shorts
-            return {
-                "value":       round(rsi_val, 1),
-                "condition":   "overbought",
-                "points":      1,
-                "description": f"RSI overbought ({rsi_val:.1f}) "
-                               f"— confirms short bias"
-            }
+            return {"value": round(rsi_val, 1),
+                    "condition": "overbought", "points": 1,
+                    "description": f"RSI overbought ({rsi_val:.1f}) "
+                                   f"— confirms short bias"}
         else:
-            # Overbought on long in non-trend = slight caution
-            return {
-                "value":       round(rsi_val, 1),
-                "condition":   "overbought",
-                "points":      -1,
-                "description": f"RSI overbought ({rsi_val:.1f}) "
-                               f"— caution on longs"
-            }
+            return {"value": round(rsi_val, 1),
+                    "condition": "overbought", "points": -1,
+                    "description": f"RSI overbought ({rsi_val:.1f}) "
+                                   f"— caution on longs"}
 
     elif rsi_val <= RSI_OVERSOLD:
         if direction == "short" and is_trend:
-            return {
-                "value":       round(rsi_val, 1),
-                "condition":   "oversold_trending",
-                "points":      2,
-                "description": f"RSI oversold ({rsi_val:.1f}) in trend "
-                               f"— strong momentum confirmation"
-            }
+            return {"value": round(rsi_val, 1),
+                    "condition": "oversold_trending", "points": 2,
+                    "description": f"RSI oversold ({rsi_val:.1f}) in trend "
+                                   f"— strong momentum confirmation"}
         elif direction == "long":
-            return {
-                "value":       round(rsi_val, 1),
-                "condition":   "oversold",
-                "points":      1,
-                "description": f"RSI oversold ({rsi_val:.1f}) "
-                               f"— confirms long bias"
-            }
+            return {"value": round(rsi_val, 1),
+                    "condition": "oversold", "points": 1,
+                    "description": f"RSI oversold ({rsi_val:.1f}) "
+                                   f"— confirms long bias"}
         else:
-            return {
-                "value":       round(rsi_val, 1),
-                "condition":   "oversold",
-                "points":      -1,
-                "description": f"RSI oversold ({rsi_val:.1f}) "
-                               f"— caution on shorts"
-            }
+            return {"value": round(rsi_val, 1),
+                    "condition": "oversold", "points": -1,
+                    "description": f"RSI oversold ({rsi_val:.1f}) "
+                                   f"— caution on shorts"}
 
-    # Neutral RSI
-    return {
-        "value":       round(rsi_val, 1),
-        "condition":   "neutral",
-        "points":      0,
-        "description": f"RSI neutral ({rsi_val:.1f})"
-    }
+    return {"value": round(rsi_val, 1), "condition": "neutral",
+            "points": 0, "description": f"RSI neutral ({rsi_val:.1f})"}
 
 
 def detect_rsi_hidden_divergence(df: pd.DataFrame) -> dict:
-    """
-    Hidden divergence = trend continuation signal.
-    Bullish: price HL + RSI LL → trend continuation up
-    Bearish: price LH + RSI HH → trend continuation down
-    """
     if len(df) < RSI_PERIOD * 3:
         return {"divergence": "none", "description": "Insufficient data"}
 
@@ -341,25 +277,19 @@ def detect_rsi_hidden_divergence(df: pd.DataFrame) -> dict:
     rsi_hh   = rsi_second.max()   > rsi_first.max()
 
     if price_hl and rsi_ll:
-        return {
-            "divergence":  "bullish",
-            "description": f"Bullish hidden div — price HL, RSI LL "
-                           f"— trend continuation up"
-        }
-
+        return {"divergence": "bullish",
+                "description": "Bullish hidden div — price HL, RSI LL "
+                               "— trend continuation up"}
     if price_lh and rsi_hh:
-        return {
-            "divergence":  "bearish",
-            "description": f"Bearish hidden div — price LH, RSI HH "
-                           f"— trend continuation down"
-        }
+        return {"divergence": "bearish",
+                "description": "Bearish hidden div — price LH, RSI HH "
+                               "— trend continuation down"}
 
-    return {"divergence": "none",
-            "description": "No RSI hidden divergence"}
+    return {"divergence": "none", "description": "No RSI hidden divergence"}
 
 
 # =============================================================================
-# MACD ANALYSIS — more graduated
+# MACD ANALYSIS
 # =============================================================================
 
 def analyze_macd(df: pd.DataFrame) -> dict:
@@ -380,13 +310,10 @@ def analyze_macd(df: pd.DataFrame) -> dict:
     compression  = abs(prev_hist) < abs(prev2_hist) and \
                    abs(prev2_hist) < abs(hist.iloc[-4]) \
                    if len(hist) > 4 else False
-
     expansion    = abs(current_hist) > abs(prev_hist) and compression
     cross        = (macd_line.iloc[-1] > sig_line.iloc[-1]) != \
                    (macd_line.iloc[-2] > sig_line.iloc[-2])
     above_zero   = macd_line.iloc[-1] > 0
-
-    # Measure strength by histogram size relative to price
     price        = df["close"].iloc[-1]
     hist_strength = min(1.0, abs(current_hist) / (price * 0.001 + 1e-9))
 
@@ -474,10 +401,10 @@ def detect_squeeze(df: pd.DataFrame, period: int = 20) -> dict:
 def score(data: dict) -> dict:
     """
     Score breakdown (max 15):
-        MTF EMA alignment:        0-5  (graduated by count and strength)
-        RSI analysis:             0-3  (trending-aware, can add OR subtract)
+        MTF EMA alignment:        0-5
+        RSI trending-aware:       -1 to +3
         RSI hidden divergence:    0-3
-        MACD signal:              0-2
+        MACD:                     0-2
         Squeeze:                  0-2
     """
     candles = data.get("candles", {})
@@ -487,11 +414,8 @@ def score(data: dict) -> dict:
     if mtf_df.empty:
         return _empty_score("No MTF data")
 
-    # Get regime from macro data for RSI interpretation
-    macro_data = data.get("macro", {})
-    # We'll derive regime from VIX as proxy
-    vix    = macro_data.get("vix", 20.0)
-    regime = "trend" if vix < 20 else "neutral"
+    # Detect regime from price efficiency — same method as L4
+    regime = detect_regime(mtf_df)
 
     mtf_ema    = check_mtf_ema_alignment(candles)
     rsi_hidden = detect_rsi_hidden_divergence(mtf_df)
@@ -506,7 +430,6 @@ def score(data: dict) -> dict:
 
     # MTF EMA alignment (max 5)
     if mtf_ema["direction"] != "none":
-        # Full 5 for 4/4, 4 for 3/4, 2 for 2/4
         count = mtf_ema["count"]
         if count >= 4:
             ema_points = 5
@@ -522,7 +445,7 @@ def score(data: dict) -> dict:
             direction = "long" if mtf_ema["direction"] == "bullish" else "short"
             reasons.append(f"EMA: {mtf_ema['description']}")
 
-    # RSI — trending aware (max +3, min -1)
+    # RSI trending-aware (-1 to +3)
     rsi_result = analyze_rsi(mtf_df, direction, regime)
     rsi_points = rsi_result["points"]
     if rsi_points != 0:
@@ -537,7 +460,7 @@ def score(data: dict) -> dict:
             direction = hd_dir
         reasons.append(f"RSI hidden div: {rsi_hidden['description']}")
 
-    # MACD (max 2 — reduced from 3, more conservative)
+    # MACD (max 2)
     if macd["signal"] != "none":
         macd_dir = "long" if macd["signal"] == "bullish" else "short"
         if macd["cross"] or (macd_dir == direction):
@@ -575,6 +498,7 @@ def score(data: dict) -> dict:
             "rsi_hidden": rsi_hidden,
             "macd":       macd,
             "squeeze":    squeeze,
+            "regime":     regime,
         }
     }
 
