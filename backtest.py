@@ -59,7 +59,7 @@ log = logging.getLogger("backtest")
 
 BACKTEST_DAYS     = 365        # 1 year
 WARMUP_CANDLES    = 250        # Candles needed before scoring starts
-                               # (EMAs need history to be accurate)
+BACKTEST_SCORE_THRESHOLD = 45  # Lower than live — accounts for no live CVD
 STEP_CANDLES      = 4          # Check every 4 candles on 4H (= every 16hrs)
                                # Balances thoroughness vs speed
 FORWARD_CANDLES   = 100        # How many candles forward to check for outcome
@@ -118,12 +118,12 @@ def fetch_historical(symbol: str, interval: str, days: int) -> pd.DataFrame:
             start_time = candles[-1][0] + 1
 
             # Rate limit respect
-            time.sleep(0.1)
+            time.sleep(0.5)
 
-        except Exception as e:
+       except Exception as e:
             log.error(f"Fetch error {symbol} {interval}: {e}")
-            time.sleep(2)
-            break
+            time.sleep(5)
+            continue
 
     if not all_candles:
         return pd.DataFrame()
@@ -230,7 +230,7 @@ def score_at_point(candles: dict, symbol: str) -> dict:
     consensus   = get_direction_consensus(layer_results)
     direction   = consensus["direction"]
 
-    if total_score < SCORE_THRESHOLD_STANDARD or direction == "neutral":
+    if total_score < BACKTEST_SCORE_THRESHOLD or direction == "neutral":
         return None
 
     # Calculate trade levels
