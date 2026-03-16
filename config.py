@@ -109,6 +109,6 @@ COT_EXTREME_PCT       =  0.65
 # -----------------------------------------------------------------------------
 SCAN_INTERVAL_SECONDS      = 60
 MIN_ALERT_COOLDOWN_MINUTES = 30
-DEBUG_MODE                 = True
+DEBUG_MODE                 = False
 DRY_RUN                    = False
 LOG_FILE                   = "apex_bot.log"
