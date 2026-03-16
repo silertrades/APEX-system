@@ -8,10 +8,9 @@
 
 import time
 import logging
-
 from data_feed      import DataManager
 from scoring_engine import run as score_symbol
-from alert_manager  import send_alert, send_startup_message, send_error_alert
+from alert_manager  import send_alert, send_startup_message, send_error_alert, send_telegram
 from signal_tracker import ensure_csv_exists, get_daily_summary, check_open_signals
 import pandas as pd
 
