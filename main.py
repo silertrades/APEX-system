@@ -12,7 +12,8 @@ import logging
 from data_feed      import DataManager
 from scoring_engine import run as score_symbol
 from alert_manager  import send_alert, send_startup_message, send_error_alert
-from signal_tracker import ensure_csv_exists, get_daily_summary
+from signal_tracker import ensure_csv_exists, get_daily_summary, check_open_signals
+import pandas as pd
 
 from config import (
     CRYPTO_SYMBOLS,
@@ -31,19 +32,26 @@ log = logging.getLogger("main")
 ALL_SYMBOLS = CRYPTO_SYMBOLS + FUTURES_SYMBOLS
 
 
-def scan_symbol(dm: DataManager, symbol: str):
+def scan_symbol(dm: DataManager, symbol: str, current_prices: dict):
     """
     Runs the full APEX pipeline for one symbol.
     Fetches data → scores all 6 layers → fires alert if threshold met.
+    Also updates current price in the prices dict for outcome tracking.
     """
     try:
         # 1. Fetch all data
         data = dm.get_all(symbol)
 
-        # 2. Run scoring engine
+        # 2. Store current price for outcome tracker
+        candles = data.get("candles", {})
+        ltf_df  = candles.get("LTF", pd.DataFrame())
+        if not ltf_df.empty:
+            current_prices[symbol] = float(ltf_df["close"].iloc[-1])
+
+        # 3. Run scoring engine
         signal = score_symbol(data)
 
-        # 3. Fire alert if signal exists
+        # 4. Fire alert if signal exists
         if signal:
             log.info(
                 f"SIGNAL: {symbol} | {signal['direction'].upper()} | "
@@ -56,7 +64,6 @@ def scan_symbol(dm: DataManager, symbol: str):
     except Exception as e:
         log.error(f"Error scanning {symbol}: {e}")
         send_error_alert(f"Scan error on {symbol}: {e}")
-
 
 def main():
     log.info("=" * 60)
@@ -84,11 +91,15 @@ def main():
         scan_count += 1
         log.info(f"--- Scan #{scan_count} | {len(ALL_SYMBOLS)} symbols ---")
 
+        # Track current prices for outcome monitoring
+        current_prices = {}
+
         for symbol in ALL_SYMBOLS:
-            scan_symbol(dm, symbol)
-            # Small delay between symbols to avoid
-            # hammering the API
+            scan_symbol(dm, symbol, current_prices)
             time.sleep(2)
+
+        # Check open signals against current prices
+        check_open_signals(current_prices)
 
         log.info(
             f"Scan #{scan_count} complete. "
