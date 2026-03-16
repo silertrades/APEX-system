@@ -231,6 +231,8 @@ def score_at_point(candles: dict, symbol: str) -> dict:
     if total_score < BACKTEST_SCORE_THRESHOLD or direction == "neutral":
         return None
 
+    log.info(f"Signal candidate: {symbol} score:{total_score} dir:{direction}")
+
     # Calculate trade levels
     levels = calculate_trade_levels(data, direction)
     if not levels:
@@ -658,7 +660,7 @@ def run_backtest():
     log.info("APEX BACKTEST ENGINE STARTING")
     log.info(f"Period: {BACKTEST_DAYS} days")
     log.info(f"Symbols: {CRYPTO_SYMBOLS}")
-    log.info(f"Score threshold: {SCORE_THRESHOLD_STANDARD}")
+    log.info(f"Score threshold: {BACKTEST_SCORE_THRESHOLD} (backtest mode)")
     log.info("=" * 60)
 
     # Step 1: Fetch all historical data
