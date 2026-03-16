@@ -20,9 +20,9 @@ from config import (
     MIN_ALERT_COOLDOWN_MINUTES,
     DRY_RUN,
 )
+from signal_tracker import log_signal
 
 log = logging.getLogger("alert_manager")
-
 
 # =============================================================================
 # COOLDOWN TRACKER
