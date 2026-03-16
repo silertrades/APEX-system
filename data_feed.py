@@ -20,6 +20,7 @@ from config import (
     CRYPTO_SYMBOLS, TIMEFRAMES,
     CVD_LOOKBACK, WS_RECONNECT_SECONDS, DEBUG_MODE
 )
+from l4_macro import MacroFeed
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG_MODE else logging.INFO,
@@ -29,7 +30,6 @@ log = logging.getLogger("data_feed")
 
 BINANCE_REST = "https://api.binance.com"
 
-# Binance interval map
 BINANCE_INTERVAL_MAP = {
     "1D":  "1d",
     "4H":  "4h",
@@ -43,13 +43,13 @@ CANDLE_COUNT = 500
 
 
 # =============================================================================
-# OHLCV FEED — Binance REST API (real-time, no delay)
+# OHLCV FEED — Binance REST API
 # =============================================================================
 
 class OHLCVFeed:
 
-    def get_candles(self, symbol: str, timeframe: str, n_bars: int = CANDLE_COUNT) -> pd.DataFrame:
-        """Fetch OHLCV candles from Binance REST API."""
+    def get_candles(self, symbol: str, timeframe: str,
+                    n_bars: int = CANDLE_COUNT) -> pd.DataFrame:
         interval = BINANCE_INTERVAL_MAP.get(timeframe, "1h")
         try:
             url    = f"{BINANCE_REST}/api/v3/klines"
@@ -76,7 +76,6 @@ class OHLCVFeed:
             return pd.DataFrame()
 
     def get_all_timeframes(self, symbol: str) -> dict:
-        """Fetch all configured timeframes for a symbol."""
         result = {}
         for tf_name, tf_str in TIMEFRAMES.items():
             df = self.get_candles(symbol, tf_str)
@@ -144,7 +143,8 @@ class OrderFlowFeed:
         except Exception as e:
             log.debug(f"aggTrade parse error {symbol}: {e}")
 
-    def get_cvd_series(self, symbol: str, lookback: int = CVD_LOOKBACK) -> np.ndarray:
+    def get_cvd_series(self, symbol: str,
+                       lookback: int = CVD_LOOKBACK) -> np.ndarray:
         with self._lock:
             deltas = self.cvd_data.get(symbol, [])
         if len(deltas) < 10:
@@ -156,10 +156,12 @@ class OrderFlowFeed:
             bucketed.append(sum(recent[i:i + bucket_size]))
         return np.cumsum(bucketed[-lookback:])
 
-    def get_cvd_divergence(self, symbol: str, price_series: np.ndarray) -> dict:
+    def get_cvd_divergence(self, symbol: str,
+                           price_series: np.ndarray) -> dict:
         cvd = self.get_cvd_series(symbol, CVD_LOOKBACK)
         if len(cvd) < 5 or len(price_series) < 5:
-            return {"divergence": "none", "strength": 0.0, "description": "Insufficient data"}
+            return {"divergence": "none", "strength": 0.0,
+                    "description": "Insufficient data"}
 
         n      = min(len(cvd), len(price_series))
         cvd    = cvd[-n:]
@@ -172,87 +174,19 @@ class OrderFlowFeed:
         cvd_moved_dn   = cvd[mid:].mean()    < cvd[:mid].mean()
 
         if price_moved_dn and cvd_moved_up:
-            strength = min(1.0, abs(prices[-1] - prices[0]) / (prices[0] + 1e-9) * 10)
+            strength = min(1.0, abs(prices[-1] - prices[0]) /
+                           (prices[0] + 1e-9) * 10)
             return {"divergence": "bullish", "strength": round(strength, 3),
                     "description": "Bullish CVD div: price down, CVD up"}
 
         if price_moved_up and cvd_moved_dn:
-            strength = min(1.0, abs(prices[-1] - prices[0]) / (prices[0] + 1e-9) * 10)
+            strength = min(1.0, abs(prices[-1] - prices[0]) /
+                           (prices[0] + 1e-9) * 10)
             return {"divergence": "bearish", "strength": round(strength, 3),
                     "description": "Bearish CVD div: price up, CVD down"}
 
-        return {"divergence": "none", "strength": 0.0, "description": "No divergence"}
-
-
-# =============================================================================
-# MACRO FEED — Binance-based proxies (no yfinance delay)
-# =============================================================================
-
-class MacroFeed:
-    """
-    For crypto-only mode we use Binance-available macro proxies:
-    - VIX proxy: BTCUSDT 1D volatility (realized vol as fear gauge)
-    - DXY proxy: BTCUSDT/ETHUSDT correlation divergence
-    - Yield curve: fixed neutral value until futures data added
-    """
-
-    CACHE_TTL = 900
-
-    def __init__(self):
-        self._cache      = {}
-        self._cache_time = {}
-        self.ohlcv       = OHLCVFeed()
-
-    def _is_fresh(self, key: str) -> bool:
-        return (key in self._cache and
-                time.time() - self._cache_time.get(key, 0) < self.CACHE_TTL)
-
-    def get_vix(self) -> float:
-        """
-        Proxy VIX using BTC realized volatility.
-        High BTC vol = risk-off environment.
-        Returns a VIX-equivalent number (roughly scaled).
-        """
-        if self._is_fresh("vix_proxy"):
-            return self._cache["vix_proxy"]
-        try:
-            df = self.ohlcv.get_candles("BTCUSDT", "1D", 30)
-            if df.empty:
-                return 20.0
-            returns  = df["close"].pct_change().dropna()
-            realized = returns.std() * (365 ** 0.5) * 100
-            # Scale to VIX-like number (BTC vol ~3x traditional VIX)
-            vix_proxy = realized / 3.0
-            self._cache["vix_proxy"]      = float(vix_proxy)
-            self._cache_time["vix_proxy"] = time.time()
-            log.debug(f"VIX proxy (BTC realized vol): {vix_proxy:.1f}")
-            return self._cache["vix_proxy"]
-        except Exception as e:
-            log.error(f"VIX proxy failed: {e}")
-            return 20.0
-
-    def get_dxy_momentum(self, period: int = 10) -> float:
-        """
-        Proxy DXY using inverse BTC momentum.
-        BTC up = DXY likely weak = risk-on (negative value returned).
-        """
-        if self._is_fresh("dxy_proxy"):
-            return self._cache["dxy_proxy"]
-        try:
-            df = self.ohlcv.get_candles("BTCUSDT", "1D", 30)
-            if len(df) >= period:
-                btc_mom  = (df["close"].iloc[-1] - df["close"].iloc[-period]) / df["close"].iloc[-period]
-                dxy_proxy = -btc_mom   # Inverse relationship
-                self._cache["dxy_proxy"]      = float(dxy_proxy)
-                self._cache_time["dxy_proxy"] = time.time()
-                return self._cache["dxy_proxy"]
-        except Exception as e:
-            log.error(f"DXY proxy failed: {e}")
-        return 0.0
-
-    def get_yield_curve_slope(self) -> float:
-        """Neutral placeholder until futures/macro data added."""
-        return 1.0
+        return {"divergence": "none", "strength": 0.0,
+                "description": "No divergence"}
 
 
 # =============================================================================
@@ -304,7 +238,8 @@ class CryptoSentimentFeed:
 
             resp2 = requests.get(
                 f"{self.BINANCE_FAPI}/futures/data/openInterestHist",
-                params={"symbol": symbol, "period": "1h", "limit": 24}, timeout=5
+                params={"symbol": symbol, "period": "1h", "limit": 24},
+                timeout=5
             )
             resp2.raise_for_status()
             hist       = resp2.json()
@@ -313,7 +248,8 @@ class CryptoSentimentFeed:
                 old_oi     = float(hist[0]["sumOpenInterest"])
                 oi_chg_pct = (current_oi - old_oi) / (old_oi + 1e-9)
 
-            result                = {"oi": current_oi, "oi_change_pct": oi_chg_pct}
+            result                = {"oi": current_oi,
+                                     "oi_change_pct": oi_chg_pct}
             self._cache[key]      = result
             self._cache_time[key] = time.time()
             return result
@@ -340,11 +276,13 @@ class DataManager:
         log.debug(f"Fetching all data for {symbol}...")
 
         candles        = self.ohlcv.get_all_timeframes(symbol)
-        cvd_divergence = {"divergence": "none", "strength": 0.0, "description": "N/A"}
+        cvd_divergence = {"divergence": "none", "strength": 0.0,
+                          "description": "N/A"}
 
         if "LTF" in candles:
             close_prices   = candles["LTF"]["close"].values
-            cvd_divergence = self.order_flow.get_cvd_divergence(symbol, close_prices)
+            cvd_divergence = self.order_flow.get_cvd_divergence(
+                symbol, close_prices)
 
         macro = {
             "vix":               self.macro.get_vix(),
