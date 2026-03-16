@@ -18,8 +18,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 # SYMBOLS TO MONITOR
 # -----------------------------------------------------------------------------
 FUTURES_SYMBOLS = []
-CRYPTO_SYMBOLS  = ["BTCUSDT", "ETHUSDT"]
-
+CRYPTO_SYMBOLS  = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT", "XRPUSDT"]
 # -----------------------------------------------------------------------------
 # TIMEFRAMES
 # -----------------------------------------------------------------------------
