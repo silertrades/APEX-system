@@ -9,9 +9,10 @@
 import time
 import logging
 
-from data_feed     import DataManager
+from data_feed      import DataManager
 from scoring_engine import run as score_symbol
 from alert_manager  import send_alert, send_startup_message, send_error_alert
+from signal_tracker import ensure_csv_exists, get_daily_summary
 
 from config import (
     CRYPTO_SYMBOLS,
@@ -66,6 +67,7 @@ def main():
     log.info("=" * 60)
 
     # Initialize data manager
+    ensure_csv_exists()
     dm = DataManager()
 
     # Give WebSockets time to connect and
@@ -92,6 +94,12 @@ def main():
             f"Scan #{scan_count} complete. "
             f"Next scan in {SCAN_INTERVAL_SECONDS}s..."
         )
+
+        # Send daily summary at midnight UTC (scan #1440 = 24hrs at 60s intervals)
+        if scan_count % 1440 == 0:
+            summary = get_daily_summary()
+            send_telegram_summary(summary)
+
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 
