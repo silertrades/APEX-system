@@ -3,19 +3,14 @@
 # =============================================================================
 # Layer 1: Market Structure
 #
-# What this does:
-#   - Identifies the HTF (Daily) trend bias — bullish or bearish
-#   - Detects Break of Structure (BOS) — trend continuation signal
-#   - Detects Change of Character (CHoCH) — earliest reversal signal
-#   - Scores swing high/low quality
+# Scoring audit changes:
+#   - Trend bias now awards points for PARTIAL structure (not just perfect)
+#   - BOS scoring more graduated — rewards proximity not just confirmation
+#   - CHoCH awards points even when just approaching key level
+#   - MTF agreement scoring more generous
+#   - Overall: should score 8-15/20 in most trending conditions
 #
-# Changes from v1:
-#   - Swing lookback increased from 5 to 8 for cleaner structure detection
-#   - Minimum swing count increased to reduce noise on high-liquidity assets
-#   - BOS confirmation requires close beyond level, not just touch
-#   - Added swing strength filter — small swings ignored
-#
-# Score: 0–20 points
+# Score: 0-20 points
 # =============================================================================
 
 import numpy as np
@@ -24,11 +19,8 @@ import logging
 
 log = logging.getLogger("l1_structure")
 
-# Increased from 5 to 8 — filters out noise on liquid markets like BTC
-SWING_LOOKBACK = 8
-
-# Minimum % move to count as a valid swing
-MIN_SWING_PCT = 0.008   # 0.8%
+SWING_LOOKBACK = 6     # Reduced from 8 — catches more valid swings
+MIN_SWING_PCT  = 0.005 # Reduced from 0.008 — less filtering
 
 
 # =============================================================================
@@ -43,8 +35,7 @@ def find_swing_highs(df: pd.DataFrame,
     for i in range(lookback, len(df) - lookback):
         window = highs.iloc[i - lookback: i + lookback + 1]
         if highs.iloc[i] == window.max():
-            # Filter out tiny swings
-            avg_price = df["close"].iloc[i]
+            avg_price  = df["close"].iloc[i]
             swing_size = (highs.iloc[i] - df["low"].iloc[i]) / avg_price
             if swing_size >= MIN_SWING_PCT:
                 is_swing.iloc[i] = True
@@ -84,109 +75,148 @@ def get_recent_swings(df: pd.DataFrame,
 
 
 # =============================================================================
-# TREND BIAS
+# TREND BIAS — more graduated scoring
 # =============================================================================
 
 def get_trend_bias(df: pd.DataFrame) -> dict:
     """
-    Determines the current trend bias from swing structure.
-    Requires minimum 3 swings to confirm — reduces false signals.
+    Returns trend bias with graduated strength score.
+    Now awards points for partial structure, not just perfect HH+HL.
     """
-    if len(df) < 80:
+    if len(df) < 50:
         return {"bias": "neutral", "strength": 0.0,
                 "description": "Insufficient data"}
 
-    swings = get_recent_swings(df, lookback=SWING_LOOKBACK, n=4)
+    swings = get_recent_swings(df, lookback=SWING_LOOKBACK, n=5)
     highs  = swings["swing_highs"]
     lows   = swings["swing_lows"]
 
-    if len(highs) < 3 or len(lows) < 3:
+    if len(highs) < 2 or len(lows) < 2:
         return {"bias": "neutral", "strength": 0.0,
                 "description": "Not enough swings"}
 
-    hh = all(highs[i] > highs[i-1] for i in range(1, len(highs)))
-    hl = all(lows[i]  > lows[i-1]  for i in range(1, len(lows)))
-    lh = all(highs[i] < highs[i-1] for i in range(1, len(highs)))
-    ll = all(lows[i]  < lows[i-1]  for i in range(1, len(lows)))
+    # Count bullish vs bearish swing comparisons
+    bull_score = 0
+    bear_score = 0
+    total      = 0
 
-    if hh and hl:
-        high_diffs = [highs[i] - highs[i-1] for i in range(1, len(highs))]
-        low_diffs  = [lows[i]  - lows[i-1]  for i in range(1, len(lows))]
-        strength   = min(1.0, (np.mean(high_diffs) + np.mean(low_diffs)) /
-                        (df["close"].iloc[-1] * 0.02))
+    # Check highs
+    for i in range(1, len(highs)):
+        total += 1
+        if highs[i] > highs[i-1]:
+            bull_score += 1
+        elif highs[i] < highs[i-1]:
+            bear_score += 1
+
+    # Check lows
+    for i in range(1, len(lows)):
+        total += 1
+        if lows[i] > lows[i-1]:
+            bull_score += 1
+        elif lows[i] < lows[i-1]:
+            bear_score += 1
+
+    if total == 0:
+        return {"bias": "neutral", "strength": 0.0,
+                "description": "No swing comparisons"}
+
+    bull_pct = bull_score / total
+    bear_pct = bear_score / total
+
+    if bull_pct >= 0.6:
         return {
             "bias":        "bullish",
-            "strength":    round(strength, 3),
-            "description": f"HH+HL structure confirmed ({len(highs)} swings)"
+            "strength":    round(bull_pct, 3),
+            "description": f"Bullish structure ({bull_score}/{total} swings bullish)"
         }
-
-    if lh and ll:
-        high_diffs = [highs[i-1] - highs[i] for i in range(1, len(highs))]
-        low_diffs  = [lows[i-1]  - lows[i]  for i in range(1, len(lows))]
-        strength   = min(1.0, (np.mean(high_diffs) + np.mean(low_diffs)) /
-                        (df["close"].iloc[-1] * 0.02))
+    elif bear_pct >= 0.6:
         return {
             "bias":        "bearish",
-            "strength":    round(strength, 3),
-            "description": f"LH+LL structure confirmed ({len(highs)} swings)"
+            "strength":    round(bear_pct, 3),
+            "description": f"Bearish structure ({bear_score}/{total} swings bearish)"
+        }
+    elif bull_pct > bear_pct:
+        return {
+            "bias":        "bullish",
+            "strength":    round(bull_pct * 0.5, 3),
+            "description": f"Mild bullish structure ({bull_score}/{total})"
+        }
+    elif bear_pct > bull_pct:
+        return {
+            "bias":        "bearish",
+            "strength":    round(bear_pct * 0.5, 3),
+            "description": f"Mild bearish structure ({bear_score}/{total})"
         }
 
-    if hh or hl:
-        return {"bias": "bullish", "strength": 0.3,
-                "description": "Partial bullish structure"}
-    if lh or ll:
-        return {"bias": "bearish", "strength": 0.3,
-                "description": "Partial bearish structure"}
-
     return {"bias": "neutral", "strength": 0.0,
-            "description": "No clear structure"}
+            "description": "Mixed structure"}
 
 
 # =============================================================================
-# BREAK OF STRUCTURE (BOS)
+# BREAK OF STRUCTURE
 # =============================================================================
 
 def detect_bos(df: pd.DataFrame) -> dict:
     """
-    Break of Structure — price CLOSES beyond the most recent swing high/low.
-    Requires a candle close, not just a wick — reduces fakeout signals.
+    Detects BOS. Now also awards partial points when price is
+    approaching a key level (within 0.5%) even before breaking it.
     """
-    if len(df) < 30:
-        return {"bos": "none", "level": 0.0, "description": "Insufficient data"}
+    if len(df) < 20:
+        return {"bos": "none", "level": 0.0,
+                "strength": 0.0, "description": "Insufficient data"}
 
     swings     = get_recent_swings(df, lookback=SWING_LOOKBACK, n=3)
     last_close = df["close"].iloc[-1]
 
     if len(swings["swing_highs"]) > 0:
-        prev_swing_high = swings["swing_highs"][-1]
-        if last_close > prev_swing_high:
+        prev_high = swings["swing_highs"][-1]
+        if last_close > prev_high:
             return {
                 "bos":         "bullish",
-                "level":       round(prev_swing_high, 2),
-                "description": f"Bullish BOS — closed above {prev_swing_high:.2f}"
+                "level":       round(prev_high, 2),
+                "strength":    1.0,
+                "description": f"Bullish BOS — closed above {prev_high:.2f}"
+            }
+        # Near miss — within 0.5%
+        proximity = (prev_high - last_close) / last_close
+        if proximity <= 0.005:
+            return {
+                "bos":         "bullish_approaching",
+                "level":       round(prev_high, 2),
+                "strength":    0.5,
+                "description": f"Approaching bullish BOS at {prev_high:.2f} "
+                               f"({proximity*100:.2f}% away)"
             }
 
     if len(swings["swing_lows"]) > 0:
-        prev_swing_low = swings["swing_lows"][-1]
-        if last_close < prev_swing_low:
+        prev_low = swings["swing_lows"][-1]
+        if last_close < prev_low:
             return {
                 "bos":         "bearish",
-                "level":       round(prev_swing_low, 2),
-                "description": f"Bearish BOS — closed below {prev_swing_low:.2f}"
+                "level":       round(prev_low, 2),
+                "strength":    1.0,
+                "description": f"Bearish BOS — closed below {prev_low:.2f}"
+            }
+        proximity = (last_close - prev_low) / last_close
+        if proximity <= 0.005:
+            return {
+                "bos":         "bearish_approaching",
+                "level":       round(prev_low, 2),
+                "strength":    0.5,
+                "description": f"Approaching bearish BOS at {prev_low:.2f} "
+                               f"({proximity*100:.2f}% away)"
             }
 
-    return {"bos": "none", "level": 0.0, "description": "No BOS detected"}
+    return {"bos": "none", "level": 0.0, "strength": 0.0,
+            "description": "No BOS detected"}
 
 
 # =============================================================================
-# CHANGE OF CHARACTER (CHoCH)
+# CHANGE OF CHARACTER
 # =============================================================================
 
 def detect_choch(df: pd.DataFrame, trend_bias: str) -> dict:
-    """
-    Change of Character — first sign of trend reversal.
-    """
-    if len(df) < 30 or trend_bias == "neutral":
+    if len(df) < 20 or trend_bias == "neutral":
         return {"choch": False, "direction": "none", "level": 0.0,
                 "description": "No CHoCH — neutral structure"}
 
@@ -218,11 +248,11 @@ def detect_choch(df: pd.DataFrame, trend_bias: str) -> dict:
 
 
 # =============================================================================
-# MULTI-TIMEFRAME STRUCTURE AGREEMENT
+# MTF AGREEMENT
 # =============================================================================
 
 def get_mtf_agreement(candles: dict) -> dict:
-    biases = {}
+    biases     = {}
     for tf_name, df in candles.items():
         if not df.empty:
             bias = get_trend_bias(df)
@@ -232,20 +262,24 @@ def get_mtf_agreement(candles: dict) -> dict:
     bearish_count = sum(1 for b in biases.values() if b == "bearish")
     total         = len(biases)
 
-    if bullish_count >= total * 0.75:
+    if total == 0:
+        return {"agreement": "mixed", "score": 0,
+                "description": "No timeframe data"}
+
+    if bullish_count >= total * 0.6:
         return {
             "agreement":   "bullish",
             "score":       bullish_count,
             "description": f"Bullish on {bullish_count}/{total} timeframes"
         }
-    if bearish_count >= total * 0.75:
+    if bearish_count >= total * 0.6:
         return {
             "agreement":   "bearish",
             "score":       bearish_count,
             "description": f"Bearish on {bearish_count}/{total} timeframes"
         }
 
-    dominant = "bullish" if bullish_count > bearish_count else "bearish"
+    dominant = "bullish" if bullish_count >= bearish_count else "bearish"
     return {
         "agreement":   "mixed",
         "score":       max(bullish_count, bearish_count),
@@ -255,23 +289,22 @@ def get_mtf_agreement(candles: dict) -> dict:
 
 
 # =============================================================================
-# MAIN SCORER
+# MAIN SCORER — more graduated point awards
 # =============================================================================
 
 def score(data: dict) -> dict:
     """
-    Main entry point — called by scoring_engine.py
-
     Score breakdown (max 20):
-        HTF bias clear:          +6
-        MTF agreement:           +4
-        BOS confirmed:           +6
-        CHoCH detected:          +4
+        HTF bias:        0-7  (graduated by strength)
+        MTF agreement:   0-5  (graduated by count)
+        BOS:             0-6  (full=6, approaching=3)
+        CHoCH:           0-4
+        Bonus:           +2 if BOS + CHoCH both fire same direction
     """
     candles = data.get("candles", {})
 
     if not candles:
-        return _empty_score("No candle data available")
+        return _empty_score("No candle data")
 
     htf_df = candles.get("HTF", pd.DataFrame())
     mtf_df = candles.get("MTF", pd.DataFrame())
@@ -284,52 +317,59 @@ def score(data: dict) -> dict:
     mtf_bias      = get_trend_bias(mtf_df) if not mtf_df.empty else \
                     {"bias": "neutral", "strength": 0.0}
     bos           = detect_bos(mtf_df) if not mtf_df.empty else \
-                    {"bos": "none"}
+                    {"bos": "none", "strength": 0.0}
     choch         = detect_choch(ltf_df, htf_bias["bias"]) \
                     if not ltf_df.empty else \
                     {"choch": False, "direction": "none"}
     mtf_agreement = get_mtf_agreement(candles)
 
-    points  = 0
-    reasons = []
+    points    = 0
+    reasons   = []
+    direction = "neutral"
 
-    # HTF bias (max 6)
+    # HTF bias (max 7 — graduated by strength)
     if htf_bias["bias"] != "neutral":
-        bias_points = int(6 * htf_bias["strength"])
-        bias_points = max(2, min(6, bias_points))
+        bias_points = int(7 * htf_bias["strength"])
+        bias_points = max(2, min(7, bias_points))
         points     += bias_points
-        reasons.append(f"HTF {htf_bias['bias']} "
-                       f"({htf_bias['description']})")
+        direction   = "long" if htf_bias["bias"] == "bullish" else "short"
+        reasons.append(f"HTF {htf_bias['bias']}: "
+                       f"{htf_bias['description']}")
 
-    # MTF agreement (max 4)
+    # MTF agreement (max 5 — graduated by how many TFs agree)
+    agree_score = mtf_agreement["score"]
     if mtf_agreement["agreement"] != "mixed":
-        agree_points = min(4, mtf_agreement["score"])
+        agree_points = min(5, agree_score + 1)
         points      += agree_points
-        reasons.append(f"MTF agreement: {mtf_agreement['description']}")
+        reasons.append(f"MTF: {mtf_agreement['description']}")
+    elif agree_score >= 2:
+        points += 2
+        reasons.append(f"Partial MTF: {mtf_agreement['description']}")
 
-    # BOS (max 6)
-    if bos["bos"] != "none":
-        if bos["bos"] == htf_bias["bias"]:
-            points += 6
-            reasons.append(f"BOS confirmed: {bos['description']}")
-        else:
-            points += 2
-            reasons.append(f"BOS against trend: {bos['description']}")
+    # BOS (max 6 — full BOS = 6, approaching = 3)
+    bos_type = bos.get("bos", "none")
+    if bos_type in ["bullish", "bearish"]:
+        points += 6
+        if direction == "neutral":
+            direction = "long" if bos_type == "bullish" else "short"
+        reasons.append(f"BOS: {bos['description']}")
+    elif bos_type in ["bullish_approaching", "bearish_approaching"]:
+        points += 3
+        if direction == "neutral":
+            direction = "long" if "bullish" in bos_type else "short"
+        reasons.append(f"Near BOS: {bos['description']}")
 
     # CHoCH (max 4)
     if choch["choch"]:
         points += 4
+        if direction == "neutral":
+            direction = "long" if choch["direction"] == "bullish" else "short"
         reasons.append(f"CHoCH: {choch['description']}")
 
-    # Direction
-    if htf_bias["bias"] == "bullish" and bos.get("bos") == "bullish":
-        direction = "long"
-    elif htf_bias["bias"] == "bearish" and bos.get("bos") == "bearish":
-        direction = "short"
-    elif htf_bias["bias"] != "neutral":
-        direction = "long" if htf_bias["bias"] == "bullish" else "short"
-    else:
-        direction = "neutral"
+    # Confluence bonus
+    if (bos_type in ["bullish", "bearish"] and choch["choch"]):
+        points += 2
+        reasons.append("BOS + CHoCH confluence bonus")
 
     points = min(20, points)
 
