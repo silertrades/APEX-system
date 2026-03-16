@@ -88,7 +88,7 @@ TF_INTERVALS = {
 def fetch_historical(symbol: str, interval: str, days: int) -> pd.DataFrame:
     """
     Fetches full historical OHLCV data from Binance.
-    Handles pagination — Binance max is 1000 candles per request.
+    Handles pagination and rate limiting with retries.
     """
     log.info(f"Fetching {symbol} {interval} — {days} days...")
 
@@ -116,11 +116,9 @@ def fetch_historical(symbol: str, interval: str, days: int) -> pd.DataFrame:
 
             all_candles.extend(candles)
             start_time = candles[-1][0] + 1
-
-            # Rate limit respect
             time.sleep(0.5)
 
-       except Exception as e:
+        except Exception as e:
             log.error(f"Fetch error {symbol} {interval}: {e}")
             time.sleep(5)
             continue
