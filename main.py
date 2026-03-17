@@ -14,7 +14,9 @@ import pandas as pd
 
 from data_feed      import DataManager
 from scoring_engine import run as score_symbol
-from alert_manager  import send_alert, send_startup_message, send_error_alert, send_telegram
+from alert_manager  import (send_alert, send_startup_message,
+                             send_error_alert, send_telegram,
+                             send_building_alert)
 from signal_tracker import ensure_csv_exists, get_daily_summary, check_open_signals
 from dashboard      import start_dashboard, update_scores
 
@@ -42,23 +44,17 @@ def build_score_update(symbol: str, signal_result, data: dict) -> dict:
     Works whether a signal fired or not — always updates dashboard.
     """
     candles = data.get("candles", {})
-    ltf_df  = candles.get("LTF", pd.DataFrame())
+    layers  = []
+    score   = 0
+    direction = "neutral"
+    regime    = "neutral"
 
-    # If no signal fired we need to run layers anyway for dashboard
-    # scoring_engine.run() already ran them — extract from result if available
     if signal_result:
-        layers      = signal_result.get("layer_scores", [])
-        score       = signal_result.get("score", 0)
-        direction   = signal_result.get("direction", "neutral")
-        regime      = signal_result.get("regime", "neutral")
+        layers    = signal_result.get("layer_scores", [])
+        score     = signal_result.get("score", 0)
+        direction = signal_result.get("direction", "neutral")
+        regime    = signal_result.get("regime", "neutral")
     else:
-        # Signal didn't fire — we still want layer scores for display
-        # Run a lightweight version just for the dashboard
-        layers    = []
-        score     = 0
-        direction = "neutral"
-        regime    = "neutral"
-
         try:
             import l1_structure, l2_order_flow, l3_zones
             import l4_macro, l5_momentum, l6_sentiment
@@ -71,7 +67,6 @@ def build_score_update(symbol: str, signal_result, data: dict) -> dict:
                 except Exception as e:
                     log.debug(f"Layer error for dashboard: {e}")
 
-            # Calculate score
             total = 0.0
             for r in layers:
                 w = LAYER_WEIGHTS.get(r["layer"], 10)
@@ -122,7 +117,10 @@ def scan_symbol(dm: DataManager, symbol: str,
         # 3. Run scoring engine
         signal = score_symbol(data)
 
-        # 4. Fire alert if signal exists
+        # 4. Update dashboard scores FIRST so building alert can read them
+        dashboard_scores[symbol] = build_score_update(symbol, signal, data)
+
+        # 5. Fire alert if signal exists
         if signal:
             log.info(
                 f"SIGNAL: {symbol} | {signal['direction'].upper()} | "
@@ -130,8 +128,21 @@ def scan_symbol(dm: DataManager, symbol: str,
             )
             send_alert(signal)
 
-        # 5. Update dashboard with latest scores
-        dashboard_scores[symbol] = build_score_update(symbol, signal, data)
+        # 6. Fire building alert if score is 50+ but below threshold
+        elif dashboard_scores.get(symbol):
+            sym_score     = dashboard_scores[symbol].get("score", 0)
+            sym_direction = dashboard_scores[symbol].get("direction", "neutral")
+            sym_layers    = dashboard_scores[symbol].get("layers", {})
+
+            # Convert layers dict to list format for alert
+            layer_list = [
+                {"layer": k, "score": v["score"], "max": v["max"]}
+                for k, v in sym_layers.items()
+            ]
+
+            if sym_score >= 50 and sym_direction != "neutral":
+                send_building_alert(
+                    symbol, sym_score, sym_direction, layer_list)
 
     except Exception as e:
         log.error(f"Error scanning {symbol}: {e}")
