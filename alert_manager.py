@@ -259,3 +259,46 @@ def send_error_alert(error: str):
     if not DRY_RUN:
         send_telegram(message)
     log.error(f"Error alert: {error}")
+def send_building_alert(symbol: str, score: float, direction: str,
+                        layer_scores: list):
+    """
+    Fires when a symbol crosses 50+ score — early warning
+    that conditions are building toward a signal.
+    Only fires once per symbol per cooldown period.
+    """
+    # Reuse the cooldown tracker with a different key
+    alert_key = f"{symbol}_building"
+
+    if not _cooldown.can_alert(alert_key):
+        return
+
+    # Build layer summary
+    layer_lines = []
+    for r in layer_scores:
+        name  = r.get("layer", "").replace("L", "L").replace("_", " ")
+        score_val = r.get("score", 0)
+        max_val   = r.get("max", 0)
+        pct   = int(score_val / max_val * 100) if max_val > 0 else 0
+        bar   = "█" * (pct // 20) + "░" * (5 - pct // 20)
+        layer_lines.append(f"`{bar}` {name}: {score_val}/{max_val}")
+
+    layers_text = "\n".join(layer_lines)
+
+    message = (
+        f"👀 *Score Building — {symbol}*\n"
+        f"Score: `{score}/100` · {direction.upper()}\n"
+        f"_{int(65 - score)} points from signal threshold_\n"
+        f"\n"
+        f"{layers_text}\n"
+        f"\n"
+        f"_Watch this symbol — conditions improving_"
+    )
+
+    if DRY_RUN:
+        log.info(f"DRY RUN building alert: {symbol} {score}/100")
+        print(f"\nBUILDING ALERT: {symbol} {score}/100 {direction}\n")
+    else:
+        send_telegram(message)
+
+    _cooldown.record_alert(alert_key)
+    log.info(f"Building alert sent: {symbol} {score}/100")
